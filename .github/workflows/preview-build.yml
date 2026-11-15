@@ -1,0 +1,98 @@
+name: Preview Build
+
+on:
+  workflow_call:
+    inputs:
+      write-cache:
+        required: true
+        type: boolean
+
+jobs:
+  preview-build:
+    name: 'Create Preview Build'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: 'Checkout Repository'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: 'Set Registry Cache Image'
+        run: echo "CACHE_IMAGE=ghcr.io/${GITHUB_REPOSITORY@L}-build-cache" >> "${GITHUB_ENV}"
+
+      - name: 'Login to GitHub Container Registry'
+        if: inputs.write-cache
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 'Set up Docker Buildx'
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+
+      - name: 'Build Release Artifact'
+        id: build_read_cache
+        if: ${{ !inputs.write-cache }}
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        with:
+          build-args: |
+            FOSSBILLING_VERSION=${{ github.sha }}
+            FOSSBILLING_VERSION_TRUNCATE=7
+            SENTRY_DSN=${{ vars.SENTRY_DSN }}
+          cache-from: type=registry,ref=${{ env.CACHE_IMAGE }}:cache-preview-amd64
+          context: .
+          target: release-artifact
+          outputs: type=local,dest=./release-tree
+          provenance: false
+
+      - name: 'Build Release Artifact'
+        id: build_write_cache
+        if: inputs.write-cache
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        with:
+          build-args: |
+            FOSSBILLING_VERSION=${{ github.sha }}
+            FOSSBILLING_VERSION_TRUNCATE=7
+            SENTRY_DSN=${{ vars.SENTRY_DSN }}
+          cache-from: type=registry,ref=${{ env.CACHE_IMAGE }}:cache-preview-amd64
+          cache-to: type=registry,ref=${{ env.CACHE_IMAGE }}:cache-preview-amd64,mode=max
+          context: .
+          target: release-artifact
+          outputs: type=local,dest=./release-tree
+          provenance: false
+
+      - name: 'Create Preview Build Archive'
+        id: archive
+        run: |
+          rm -f ./release-tree/provenance.json
+          tar -cf /tmp/build.tar -C ./release-tree ./
+
+      - name: 'Upload Preview Build Archive'
+        id: upload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          if-no-files-found: 'error'
+          name: preview-build
+          path: /tmp/build.tar
+          retention-days: 1
+
+      - name: 'Write Job Summary'
+        if: always()
+        run: |
+          cat >> "${GITHUB_STEP_SUMMARY}" <<'EOF'
+          ## Preview Build
+
+          | Item | Value |
+          | --- | --- |
+          | Release version | `${{ github.sha }}` |
+          | Registry cache | `${{ env.CACHE_IMAGE }}:cache-preview-amd64` |
+          | Cache mode | `${{ inputs.write-cache && 'read/write' || 'read-only' }}` |
+          | Build target | `release-artifact` |
+          | Build output | `./release-tree` |
+          | Uploaded artifact | `preview-build` |
+          | Docker build | `${{ inputs.write-cache && steps.build_write_cache.outcome || steps.build_read_cache.outcome }}` |
+          | Archive | `${{ steps.archive.outcome }}` |
+          | Artifact upload | `${{ steps.upload.outcome }}` |
+          EOF

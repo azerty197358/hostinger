@@ -1,0 +1,21 @@
+parameters:
+	level: 5
+	reportUnmatchedIgnoredErrors: false
+	dynamicConstantNames:
+		- DEBUG
+		- INSTANCE_ID
+	paths:
+		- src
+	bootstrapFiles:
+		- src/load.php
+	excludePaths:
+		analyse:
+		- src/vendor
+		- src/library/Server/Manager/Custom.php
+		- src/library/Server/Manager/Whm.php
+		- src/data/cache (?)
+		- '*/tests/*'
+	ignoreErrors:
+		- '#^Function __trans not found\.$#'
+		- '#^Function __pluralTrans not found\.$#'
+		- '#^Inner named functions are not supported by PHPStan\. Consider refactoring to an anonymous function, class method, or a top\-level\-defined function\. See issue \#165 \(https\://github\.com/phpstan/phpstan/issues/165\) for more details\.$#'

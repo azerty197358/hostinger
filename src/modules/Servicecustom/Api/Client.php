@@ -1,0 +1,47 @@
+<?php
+
+declare(strict_types=1);
+/**
+ * Copyright 2022-2025 FOSSBilling
+ * SPDX-License-Identifier: Apache-2.0.
+ *
+ * @copyright FOSSBilling (https://www.fossbilling.org)
+ * @license http://www.apache.org/licenses/LICENSE-2.0 Apache-2.0
+ */
+
+namespace Box\Mod\Servicecustom\Api;
+
+use FOSSBilling\Core\Validation\Api\RequiredParams;
+
+/**
+ * Custom product management.
+ */
+class Client extends \FOSSBilling\Core\Api\AbstractApi
+{
+    /**
+     * Call a method from the service's plugin.
+     * Pass any additional params and they will be passed to the plugin method.
+     *
+     * @throws \FOSSBilling\Core\Exception\BaseException
+     */
+    #[RequiredParams(['order_id' => 'Order ID is required', 'method' => 'Method is required'])]
+    public function call($data)
+    {
+        if (!isset($data['order_id'])) {
+            throw new \FOSSBilling\Core\Exception\BaseException('Order ID is required');
+        }
+
+        if (!isset($data['method'])) {
+            throw new \FOSSBilling\Core\Exception\BaseException('Method is required');
+        }
+
+        if (!is_string($data['method'])) {
+            throw new \FOSSBilling\Core\Exception\BaseException('Method must be a string');
+        }
+
+        $identity = $this->getIdentity();
+        $model = $this->getService()->getServiceCustomByOrderId($data['order_id'], $identity->getId());
+
+        return $this->getService()->customCall($model, $data['method'], $data);
+    }
+}

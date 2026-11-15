@@ -1,0 +1,1392 @@
+<?php
+
+declare(strict_types=1);
+/**
+ * Copyright 2022-2025 FOSSBilling
+ * SPDX-License-Identifier: Apache-2.0.
+ *
+ * @copyright FOSSBilling (https://www.fossbilling.org)
+ * @license http://www.apache.org/licenses/LICENSE-2.0 Apache-2.0
+ */
+
+namespace Box\Mod\Email;
+
+use Box\Mod\Client\Entity\Client;
+use Box\Mod\Currency\Entity\Currency;
+use Box\Mod\Email\Entity\ActivityClientEmail;
+use Box\Mod\Email\Entity\EmailTemplate;
+use Box\Mod\Email\Entity\EmailTemplateGroup;
+use Box\Mod\Email\Entity\QueuedEmail;
+use Box\Mod\Email\Repository\ActivityClientEmailRepository;
+use Box\Mod\Email\Repository\EmailTemplateGroupRepository;
+use Box\Mod\Email\Repository\EmailTemplateRepository;
+use Box\Mod\Email\Repository\QueuedEmailRepository;
+use Box\Mod\Staff\Entity\Admin;
+use FOSSBilling\Core\Enums\ExtensionType;
+use FOSSBilling\Core\Pagination\Options;
+use FOSSBilling\Core\System\Config;
+use FOSSBilling\Core\System\Environment;
+use Symfony\Component\Filesystem\Filesystem;
+use Symfony\Component\Filesystem\Path;
+use Symfony\Component\Finder\Finder;
+
+class Service implements \FOSSBilling\Core\Container\InjectionAwareInterface
+{
+    protected ?\Pimple\Container $di = null;
+    protected EmailTemplateRepository $templateRepository;
+    protected EmailTemplateGroupRepository $templateGroupRepository;
+    protected ActivityClientEmailRepository $activityClientEmailRepository;
+    protected QueuedEmailRepository $queuedEmailRepository;
+    private Filesystem $filesystem;
+
+    /**
+     * Cache of the parsed "Bcc" setting for the lifetime of this instance, so an invalid
+     * configured address is logged once per batch run rather than once per queued email.
+     *
+     * @var string[]|null
+     */
+    private ?array $validatedBccAddresses = null;
+
+    /**
+     * Templates carrying single-use secrets (reset links, confirmation links).
+     * Their rendered bodies must never sit in the queue or the email history
+     * where staff with email access could read them, and they must never be
+     * copied to the BCC address.
+     */
+    private const array SECRET_TEMPLATE_CODES = [
+        'mod_client_password_reset_request',
+        'mod_client_password_reset_information',
+        'mod_client_confirm',
+        'mod_client_signup',
+        'mod_client_signup_admin',
+        'mod_staff_password_reset_request',
+        'mod_staff_password_reset_approve',
+    ];
+
+    public function __construct()
+    {
+        $this->filesystem = new Filesystem();
+    }
+
+    public function setDi(\Pimple\Container $di): void
+    {
+        $this->di = $di;
+        $this->templateRepository = $di['em']->getRepository(EmailTemplate::class);
+        $this->templateGroupRepository = $di['em']->getRepository(EmailTemplateGroup::class);
+        $this->activityClientEmailRepository = $di['em']->getRepository(ActivityClientEmail::class);
+        $this->queuedEmailRepository = $di['em']->getRepository(QueuedEmail::class);
+        if (isset($di['filesystem'])) {
+            $this->filesystem = $di['filesystem'];
+        }
+    }
+
+    public function getDi(): ?\Pimple\Container
+    {
+        return $this->di;
+    }
+
+    public function getTemplateRepository(): EmailTemplateRepository
+    {
+        return $this->templateRepository;
+    }
+
+    public function getTemplateGroupRepository(): EmailTemplateGroupRepository
+    {
+        return $this->templateGroupRepository;
+    }
+
+    public function getActivityClientEmailRepository(): ActivityClientEmailRepository
+    {
+        return $this->activityClientEmailRepository;
+    }
+
+    public function getQueuedEmailRepository(): QueuedEmailRepository
+    {
+        return $this->queuedEmailRepository;
+    }
+
+    public function getModulePermissions(): array
+    {
+        return [
+            'view_email_history' => [
+                'type' => 'bool',
+                'display_name' => \__trans('View email history'),
+                'description' => \__trans('Allows the staff member to view sent emails and queued email messages.'),
+            ],
+            'delete_email_history' => [
+                'type' => 'bool',
+                'display_name' => \__trans('Delete email history'),
+                'description' => \__trans('Allows the staff member to delete sent email log entries.'),
+            ],
+            'send_emails' => [
+                'type' => 'bool',
+                'display_name' => \__trans('Send emails'),
+                'description' => \__trans('Allows the staff member to send, resend, and process queued emails.'),
+            ],
+            'view_templates' => [
+                'type' => 'bool',
+                'display_name' => \__trans('View email templates'),
+                'description' => \__trans('Allows the staff member to view email templates and template details.'),
+            ],
+            'manage_templates' => [
+                'type' => 'bool',
+                'display_name' => \__trans('Manage email templates'),
+                'description' => \__trans('Allows the staff member to create, update, delete, reset, and regenerate email templates.'),
+            ],
+            'manage_settings' => [],
+        ];
+    }
+
+    public function rmByClient(Client $client): bool
+    {
+        $this->getActivityClientEmailRepository()->deleteByClientId((int) $client->getId());
+
+        return true;
+    }
+
+    /** Synthetic preview data only; live delivery variables are never retained on templates. */
+    public function getVars(EmailTemplate $template): array
+    {
+        // A custom action's variables come from its caller, not bundled preview fixtures.
+        if ($template->isCustom()) {
+            return [];
+        }
+        $vars = $this->getTemplateVarDefaults($template->getActionCode());
+        if (str_starts_with($template->getActionCode(), 'mod_invoice_')) {
+            $currency = $this->di['mod_service']('currency')->getCurrencyRepository()->findDefault();
+            if ($currency instanceof Currency) {
+                $vars['invoice']['currency'] = $currency->getCode();
+            }
+        }
+
+        return $vars;
+    }
+
+    private function getTemplateVarDefaults(string $actionCode): array
+    {
+        $staff = [
+            'id' => 1,
+            'email' => 'staff@example.com',
+            'name' => 'Staff Member',
+            'signature' => '',
+        ];
+        $client = [
+            'id' => 1,
+            'email' => 'client@example.com',
+            'email_approved' => true,
+            'type' => 'individual',
+            'company' => '',
+            'company_vat' => '',
+            'company_number' => '',
+            'first_name' => 'Example',
+            'last_name' => 'Client',
+            'gender' => '',
+            'birthday' => '',
+            'phone_cc' => '',
+            'phone' => '',
+            'address_1' => '',
+            'address_2' => '',
+            'city' => '',
+            'state' => '',
+            'postcode' => '',
+            'country' => '',
+            'currency' => '',
+            'lang' => '',
+            'timezone' => '',
+        ];
+        $message = [
+            'id' => 1,
+            'content' => 'Example ticket message',
+            'attachment' => '',
+            'created_at' => '',
+            'updated_at' => '',
+            'author' => [
+                'name' => 'Example Client',
+                'role' => 'client',
+            ],
+        ];
+        $ticket = [
+            'id' => 1,
+            'subject' => 'Example support ticket',
+            'status' => 'open',
+            'priority' => 100,
+            'created_at' => '',
+            'updated_at' => '',
+            'replies' => 0,
+            'first' => $message,
+            'helpdesk' => [
+                'id' => 1,
+                'name' => 'Support',
+                'can_reopen' => true,
+            ],
+            'author' => [
+                'id' => 1,
+                'name' => 'Example Client',
+                'first_name' => 'Example',
+                'last_name' => 'Client',
+                'email' => 'client@example.com',
+                'role' => 'client',
+            ],
+            'client' => [
+                'id' => 1,
+                'first_name' => 'Example',
+                'last_name' => 'Client',
+            ],
+            'messages' => [$message],
+        ];
+        $staffTicket = $ticket;
+        $staffTicket['client'] = $client;
+
+        $base = [
+            'c' => $client,
+            'client' => $client,
+            'staff' => $staff,
+            'ticket' => $ticket,
+            'order' => [
+                'id' => 1, 'title' => 'Example service', 'currency' => 'USD',
+                'price' => 10, 'quantity' => 1, 'total' => 10, 'period' => '1M',
+                'config' => [], 'service' => [], 'status' => 'active',
+                'activated_at' => '2026-01-01', 'created_at' => '2026-01-01',
+            ],
+            'invoice' => [
+                'id' => 1, 'total' => 0, 'currency' => 'USD', 'items' => [],
+                'hash' => 'preview-invoice', 'series' => 'INV', 'nr' => 1, 'status' => 'unpaid',
+                'created_at' => '2026-01-01', 'due_at' => '2026-01-15', 'client' => $client,
+            ],
+            'service' => [
+                'domain' => 'example.com', 'sld' => 'example', 'tld' => '.com',
+                'username' => 'example', 'password' => 'preview-only',
+                'api_key' => 'preview-only-not-an-api-key',
+                'hosting_plan' => ['name' => 'Example plan'],
+                'server' => ['name' => 'Example server', 'ip' => '192.0.2.1', 'cpanel_url' => 'https://example.com/preview-only', 'ns1' => 'ns1.example.com', 'ns2' => 'ns2.example.com'],
+                'nameserver1' => 'ns1.example.com', 'nameserver2' => 'ns2.example.com',
+            ],
+            'hash' => 'preview-only-not-a-token',
+            'password' => 'preview-only',
+            'email_confirmation_link' => 'https://example.com/preview-only',
+            'message' => 'Example message',
+        ];
+
+        return array_replace($base, match ($actionCode) {
+            'mod_support_ticket_staff_open',
+            'mod_support_ticket_staff_close',
+            'mod_support_ticket_staff_reply' => ['c' => $client, 'ticket' => $ticket],
+            'mod_staff_ticket_open',
+            'mod_staff_ticket_reply',
+            'mod_staff_ticket_close' => ['staff' => $staff, 'ticket' => $staffTicket],
+            'mod_staff_password_reset_approve' => ['c' => $staff],
+            'mod_staff_client_signup' => ['c' => $client, 'staff' => $staff],
+            default => [],
+        });
+    }
+
+    public function sendTemplate($data)
+    {
+        $send = fn () => $this->sendTemplateMessage($data);
+
+        return in_array($data['code'] ?? null, self::SECRET_TEMPLATE_CODES, true)
+            ? \FOSSBilling\Core\Exception\BaseException::withProtectedDiagnostics($send)
+            : $send();
+    }
+
+    private function sendTemplateMessage($data)
+    {
+        $required = [
+            'code' => 'Template code not passed',
+        ];
+        $this->di['validator']->checkRequiredParamsForArray($required, $data);
+
+        if (!isset($data['to']) && !isset($data['to_staff']) && !isset($data['to_client']) && !isset($data['to_admin'])) {
+            throw new \FOSSBilling\Core\Exception\InformationException('Receiver is not defined. Define to or to_client or to_staff or to_admin parameter');
+        }
+        $vars = $data;
+        unset($vars['to'], $vars['to_client'], $vars['to_staff'], $vars['to_name'], $vars['from'], $vars['from_name'], $vars['to_admin'], $vars['client_billing_email']);
+        unset($vars['default_description'], $vars['default_subject'], $vars['default_template'], $vars['code'], $vars['send_now'], $vars['throw_exceptions'], $vars['attachment']);
+
+        $send_now = $data['send_now'] ?? false;
+        $throw_exceptions = $data['throw_exceptions'] ?? false;
+        $attachment = $data['attachment'] ?? null;
+
+        $template = $this->getOrCreateTemplateByCode($data['code'], $data);
+
+        // add additional variables to template
+        if (isset($data['to_staff']) && $data['to_staff']) {
+            $staffService = $this->di['mod_service']('staff');
+            $groupIds = $this->templateGroupRepository->getGroupIdsForTemplate((int) $template->getId());
+            $staffList = $groupIds === [] ? [] : $staffService->getAdminGroupMemberRepository()->getActiveStaffInGroups($groupIds);
+            $staff = ['list' => $staffList];
+            if ($staffList !== []) {
+                $vars['staff'] = $this->safeStaffTemplateVars($staffList[0]);
+            }
+        }
+
+        // add additional variables to template
+        $billingRecipient = null;
+        if (isset($data['to_client']) && $data['to_client'] > 0) {
+            $clientService = $this->di['mod_service']('client');
+            $client = $clientService->get(['id' => $data['to_client']]);
+            $customer = $clientService->toApiArray($client);
+            $vars['c'] = $customer;
+            $billingRecipient = $this->resolveClientBillingRecipient($client, $data['client_billing_email'] ?? null);
+        }
+
+        // send email to admins
+        if (isset($data['to_admin']) && $data['to_admin'] > 0) {
+            $admin = $this->di['em']->getRepository(Admin::class)->find((int) $data['to_admin']);
+            if ($admin instanceof Admin && $admin->getId() !== null) {
+                $oneStaff = [
+                    'id' => $admin->getId(),
+                    'email' => $admin->getEmail(),
+                    'name' => $admin->getName(),
+                    'signature' => $admin->getSignature(),
+                    'timezone' => $admin->getTimezone(),
+                ];
+                $vars['c'] = $this->safeStaffTemplateVars($oneStaff);
+            } else {
+                throw new \FOSSBilling\Core\Exception\InformationException('Admin not found');
+            }
+        }
+
+        // do not send inactive template
+        if (!$template->isEnabled()) {
+            return false;
+        }
+        $systemService = $this->di['mod_service']('system');
+
+        // Pick a timezone and locale for the date filters. Client-bound and
+        // individual staff-bound emails render in the recipient's timezone
+        // and language; broadcasts and misc fall through to the config
+        // defaults. An explicit recipient language outranks browser
+        // auto-detection. Staff broadcasts parse per recipient in the send
+        // loop below; the values computed here are unused for that branch.
+        $recipientTimezone = null;
+        if (isset($customer) && !empty($customer['timezone'])) {
+            $recipientTimezone = (string) $customer['timezone'];
+        } elseif (isset($oneStaff) && !empty($oneStaff['timezone'] ?? null)) {
+            $recipientTimezone = $oneStaff['timezone'];
+        }
+
+        $recipientLocale = null;
+        if (isset($customer)) {
+            $recipientLocale = $this->resolveRecipientLocale($customer);
+        } elseif (isset($oneStaff)) {
+            $recipientLocale = $this->resolveRecipientLocale($oneStaff);
+        }
+
+        [$subject, $content] = $this->_parse($template, $vars, $recipientTimezone, $recipientLocale);
+
+        $emailMod = $this->di['mod']('email');
+        $emailSettings = $emailMod->getConfig();
+
+        $customEmail = $emailSettings['from_email'] ?? '';
+        $customName = $emailSettings['from_name'] ?? '';
+
+        $companyEmail = $systemService->getParamValue('company_email');
+        $companyName = $systemService->getParamValue('company_name');
+
+        $from = $data['from'] ?? (!empty($customEmail) ? $customEmail : $companyEmail);
+        $from_name = $data['from_name'] ?? (!empty($customName) ? $customName : $companyName);
+
+        $sent = false;
+
+        if (!$from) {
+            throw new \FOSSBilling\Core\Exception\InformationException('The "from" email address cannot be empty');
+        }
+
+        // Single-use secrets must not linger in the queue/history or be BCC'd.
+        // Send them immediately; on failure the caller asks for a new link.
+        $isSecret = in_array($data['code'], self::SECRET_TEMPLATE_CODES, true);
+        if ($isSecret) {
+            $send_now = true;
+        }
+
+        if (isset($staff)) {
+            foreach ($staff['list'] as $staff) {
+                $staffVars = $vars;
+                $staffVars['staff'] = $this->safeStaffTemplateVars($staff);
+                $staffTimezone = !empty($staff['timezone'] ?? null) ? (string) $staff['timezone'] : null;
+                [$subject, $content] = $this->_parse($template, $staffVars, $staffTimezone, $this->resolveRecipientLocale($staff));
+
+                $to = $staff['email'];
+                $to_name = $staff['name'];
+                $sent = $this->sendMail($to, $from, $subject, $content, $to_name, $from_name, null, $staff['id'], $send_now, $throw_exceptions, $attachment, sensitiveDelivery: $isSecret);
+            }
+        } elseif (isset($oneStaff)) {
+            $to = $oneStaff['email'];
+            $to_name = $oneStaff['name'];
+            $sent = $this->sendMail($to, $from, $subject, $content, $to_name, $from_name, null, $oneStaff['id'], $send_now, $throw_exceptions, $attachment, sensitiveDelivery: $isSecret);
+        } elseif (isset($customer)) {
+            // A generic `to` is ignored for client-bound emails so their
+            // rendered data cannot be redirected to an arbitrary recipient.
+            $to = $billingRecipient ?? $customer['email'];
+            $to_name = $customer['first_name'] . ' ' . $customer['last_name'];
+            $sent = $this->sendMail($to, $from, $subject, $content, $to_name, $from_name, $customer['id'], null, $send_now, $throw_exceptions, $attachment, sensitiveDelivery: $isSecret);
+        } else {
+            $to = $data['to'];
+            $to_name = $data['to_name'] ?? null;
+            $sent = $this->sendMail($to, $from, $subject, $content, $to_name, $from_name, null, null, $send_now, $throw_exceptions, $attachment, sensitiveDelivery: $isSecret);
+        }
+
+        return $sent;
+    }
+
+    // The only permitted alternate recipient for a client-bound email is the
+    // client's own stored billing address. Anything else falls back to null.
+    private function resolveClientBillingRecipient(Client $client, mixed $requested): ?string
+    {
+        if (!is_string($requested) || trim($requested) === '') {
+            return null;
+        }
+
+        $stored = trim((string) $client->getBillingEmail());
+        $requested = trim($requested);
+
+        if ($stored === '' || filter_var($requested, FILTER_VALIDATE_EMAIL) === false) {
+            return null;
+        }
+
+        if (strcasecmp($stored, $requested) !== 0) {
+            $this->di['logger']->warning('Ignoring client_billing_email override that does not match the stored billing address');
+
+            return null;
+        }
+
+        return $requested;
+    }
+
+    private function safeStaffTemplateVars(array $staff): array
+    {
+        return [
+            'id' => $staff['id'],
+            'email' => $staff['email'],
+            'name' => $staff['name'],
+            'signature' => $staff['signature'],
+        ];
+    }
+
+    /**
+     * @param array{content: string, name: string, mime?: string}|null $attachment        a file to attach to the email, e.g. a generated invoice PDF
+     * @param bool                                                     $sensitiveDelivery send synchronously without persistence or BCC and protect diagnostics
+     */
+    public function sendMail($to, $from, $subject, $content, $to_name = null, $from_name = null, $client_id = null, $admin_id = null, bool $send_now = false, bool $throw_exceptions = false, ?array $attachment = null, bool $sensitiveDelivery = false): bool
+    {
+        $send = function () use ($to, $from, $subject, $content, $to_name, $from_name, $client_id, $admin_id, $send_now, $throw_exceptions, $attachment, $sensitiveDelivery): bool {
+            $email = $this->createMessage($to, $from, $subject, $content, $to_name, $from_name, $client_id, $admin_id, $attachment);
+            // Secret bodies must never reach persistent storage, even briefly.
+            if (!$sensitiveDelivery) {
+                $this->di['em']->persist($email);
+                $this->di['em']->flush();
+            }
+            if ($send_now || $sensitiveDelivery) {
+                return $this->_sendFromQueue($email, $throw_exceptions, sensitiveDelivery: $sensitiveDelivery);
+            }
+
+            return true;
+        };
+
+        return $sensitiveDelivery
+            ? \FOSSBilling\Core\Exception\BaseException::withProtectedDiagnostics($send)
+            : $send();
+    }
+
+    private function _getDefaults($data): array
+    {
+        $code = $data['code'];
+
+        $enabled = 0;
+        $subject = $data['default_subject'] ?? ucwords(str_replace('_', ' ', $code));
+        $content = $data['default_template'] ?? $this->_getVarsString();
+        $description = $data['default_description'] ?? null;
+
+        $matches = [];
+        if (preg_match('/mod_([a-zA-Z0-9]+)_([a-zA-Z0-9]+)/i', (string) $code, $matches)) {
+            $mod = $matches[1];
+        } else {
+            $mod = 'custom';
+        }
+
+        $path = Path::join(PATH_MODS, ucfirst($mod), 'templates/email', "{$code}.html.twig");
+
+        if ($this->filesystem->exists($path)) {
+            $tpl = $this->filesystem->readFile($path);
+
+            $ms = [];
+            preg_match('#{%.?block subject.?%}((.*?)+){%.?endblock.?%}#', $tpl, $ms);
+            if (isset($ms[1])) {
+                $subject = $ms[1];
+            }
+
+            $mc = [];
+            preg_match('/{%.?block content.?%}((.*?\n)+){%.?endblock.?%}/m', $tpl, $mc);
+            if (isset($mc[1])) {
+                $content = $mc[1];
+                $enabled = 1;
+            }
+        }
+
+        return [$subject, $content, $description, $enabled, $mod];
+    }
+
+    private function getDefaultTemplate(string $code, array $data = []): ?array
+    {
+        $path = $this->getDefaultTemplatePath($code);
+        if ($path === null) {
+            return null;
+        }
+
+        [$subject, $content, $description, $enabled, $category] = $this->_getDefaults(array_merge($data, ['code' => $code]));
+
+        return [
+            'action_code' => $code,
+            'category' => $category,
+            'subject' => $subject,
+            'content' => $content,
+            'description' => $description,
+            'enabled' => $enabled,
+        ];
+    }
+
+    public function hasDefaultTemplate(string $code): bool
+    {
+        return $this->getDefaultTemplatePath($code) !== null;
+    }
+
+    private function getDefaultTemplatePath(string $code): ?string
+    {
+        $matches = [];
+        if (!preg_match('/mod_([a-zA-Z0-9]+)_([a-zA-Z0-9]+)/i', $code, $matches)) {
+            return null;
+        }
+
+        $module = ucfirst($matches[1]);
+        $path = Path::join(PATH_MODS, $module, 'templates/email', "{$code}.html.twig");
+
+        return $this->filesystem->exists($path) ? $path : null;
+    }
+
+    private function isCustomTemplate(EmailTemplate $template): bool
+    {
+        return $template->isCustom();
+    }
+
+    private function createBuiltinTemplateRecord(string $code, array $default): EmailTemplate
+    {
+        $template = new EmailTemplate($code);
+        $template->setCategory($default['category'])
+            ->setDescription($default['description'])
+            ->setEnabled((bool) $default['enabled'])
+            ->setIsCustom(false)
+            ->setIsOverridden(false)
+            ->setSubject($default['subject'])
+            ->setContent($default['content']);
+
+        $em = $this->di['em'];
+        $em->persist($template);
+        $em->flush();
+
+        if ($default['category'] === 'staff') {
+            $this->assignAllGroupsToTemplate($template);
+        }
+
+        return $template;
+    }
+
+    /**
+     * Assigns every currently existing staff group to a freshly created staff
+     * notification template, so it reaches everyone by default until an admin
+     * narrows it down.
+     */
+    private function assignAllGroupsToTemplate(EmailTemplate $template): void
+    {
+        $groups = $this->di['mod_service']('staff')->getAdminGroupRepository()->findAll();
+
+        foreach ($groups as $group) {
+            $this->di['em']->persist(new EmailTemplateGroup($template, (int) $group->getId()));
+        }
+
+        $this->di['em']->flush();
+    }
+
+    private function createTemplateRecordFromData(string $code, array $data): EmailTemplate
+    {
+        $default = $this->getDefaultTemplate($code, $data);
+        if ($default !== null) {
+            return $this->createBuiltinTemplateRecord($code, $default);
+        }
+
+        [$subject, $content, $description, $enabled, $category] = $this->_getDefaults($data);
+
+        $template = new EmailTemplate($code);
+        $template->setCategory($category)
+            ->setEnabled((bool) $enabled)
+            ->setDescription($description)
+            ->setSubject($subject)
+            ->setContent($content)
+            ->setIsCustom(true);
+
+        $em = $this->di['em'];
+        $em->persist($template);
+        $em->flush();
+
+        return $template;
+    }
+
+    private function getOrCreateTemplateByCode(string $code, array $data = []): EmailTemplate
+    {
+        $template = $this->getTemplateRepository()->findOneByActionCode($code);
+        if ($template instanceof EmailTemplate) {
+            $default = $this->getDefaultTemplate($code, $data);
+            if ($default !== null && !$this->isCustomTemplate($template)) {
+                $this->syncBuiltinTemplate($template, $default);
+            }
+
+            return $template;
+        }
+
+        return $this->createTemplateRecordFromData($code, $data);
+    }
+
+    private function syncBuiltinTemplate(EmailTemplate $template, array $default): void
+    {
+        $updated = false;
+
+        if (($template->getCategory() === null || $template->getCategory() === '') && $default['category'] !== null) {
+            $template->setCategory($default['category']);
+            $updated = true;
+        }
+
+        if (($template->getDescription() === null || $template->getDescription() === '') && $default['description'] !== null) {
+            $template->setDescription($default['description']);
+            $updated = true;
+        }
+
+        if (!$template->isOverridden()) {
+            if ($template->getSubject() !== $default['subject']) {
+                $template->setSubject($default['subject']);
+                $updated = true;
+            }
+            if ($template->getContent() !== $default['content']) {
+                $template->setContent($default['content']);
+                $updated = true;
+            }
+        }
+
+        if ($updated) {
+            $this->di['em']->flush();
+        }
+    }
+
+    private function resetBuiltinTemplate(EmailTemplate $template, array $default): void
+    {
+        $template->setSubject($default['subject'])
+            ->setContent($default['content'])
+            ->setIsOverridden(false)
+            ->clearError();
+    }
+
+    private function getEffectiveTemplateParts(EmailTemplate $template): array
+    {
+        if ($this->isCustomTemplate($template)) {
+            return [$template->getSubject() ?? '', $template->getContent() ?? ''];
+        }
+
+        if ($template->getSubject() !== null && $template->getContent() !== null) {
+            return [$template->getSubject(), $template->getContent()];
+        }
+
+        $default = $this->getDefaultTemplate($template->getActionCode());
+        if ($default !== null) {
+            $subject = $template->getSubject() ?? $default['subject'];
+            $content = $template->getContent() ?? $default['content'];
+
+            return [$subject ?? '', $content ?? ''];
+        }
+
+        return [$template->getSubject() ?? '', $template->getContent() ?? ''];
+    }
+
+    private function createMessage($to, $from, $subject, $content, $to_name = null, $from_name = null, $client_id = null, $admin_id = null, ?array $attachment = null): QueuedEmail
+    {
+        $queue = new QueuedEmail();
+        $queue->setRecipient((string) $to);
+        $queue->setSender((string) $from);
+        $queue->setSubject((string) $subject);
+        $queue->setContent((string) $content);
+        $queue->setToName($to_name !== null ? (string) $to_name : null);
+        $queue->setFromName($from_name !== null ? (string) $from_name : null);
+        $queue->setClientId($client_id !== null ? (int) $client_id : null);
+        $queue->setAdminId($admin_id !== null ? (int) $admin_id : null);
+        $queue->setStatus(QueuedEmail::STATUS_PENDING);
+        $queue->setPriority(1);
+        $queue->setTries(0);
+
+        if ($attachment !== null && isset($attachment['content'], $attachment['name'])) {
+            $queue->setAttachmentName((string) $attachment['name']);
+            $queue->setAttachmentContent((string) $attachment['content']);
+            $queue->setAttachmentMime((string) ($attachment['mime'] ?? 'application/octet-stream'));
+        }
+
+        return $queue;
+    }
+
+    private function _getVarsString(): string
+    {
+        $str = '{% apply markdown_to_html %}' . PHP_EOL . PHP_EOL;
+        $str .= 'This email template was automatically generated by FOSSBilling extension.   ' . PHP_EOL;
+        $str .= 'Template is ready to be modified.   ' . PHP_EOL;
+        $str .= 'Email templates support a limited sandboxed Twig environment.   ' . PHP_EOL;
+        $str .= 'Use variables passed to the template together with the available globals such as **guest.system_company**, **guest.system_email**, and **FOSSBillingVersion**.' . PHP_EOL . PHP_EOL;
+        $str .= 'Example values available in email templates:' . PHP_EOL . PHP_EOL;
+        $str .= '{{ FOSSBillingVersion }}' . PHP_EOL . PHP_EOL;
+        $str .= '{{ guest.system_company.name }}' . PHP_EOL . PHP_EOL;
+        $str .= '{{ guest.system_email.signature }}' . PHP_EOL . PHP_EOL;
+        $str .= "{{ now|date('Y-m-d') }}" . PHP_EOL . PHP_EOL;
+
+        return $str . '{% endapply %}';
+    }
+
+    /**
+     * Resolve the locale an email should be rendered in for the given recipient.
+     *
+     * Returns the recipient's language (client `lang`, staff `lang` when
+     * present) when set, otherwise null to fall back to the active locale /
+     * config default. Validity is checked where the locale is consumed
+     * (TwigFactory), so this stays a pure extraction helper.
+     */
+    private function resolveRecipientLocale(array $recipient): ?string
+    {
+        $lang = $recipient['lang'] ?? null;
+
+        return is_string($lang) && $lang !== '' ? $lang : null;
+    }
+
+    private function _parse(EmailTemplate $template, array $vars, ?string $timezone = null, ?string $locale = null): array
+    {
+        $systemService = $this->di['mod_service']('System');
+        [$subjectTemplate, $contentTemplate] = $this->getEffectiveTemplateParts($template);
+        $protectErrors = in_array($template->getActionCode(), self::SECRET_TEMPLATE_CODES, true);
+
+        try {
+            $pc = $systemService->renderEmailTplString($contentTemplate, $vars, $timezone, $locale, protectErrors: $protectErrors);
+            $ps = $systemService->renderEmailSubjectString($subjectTemplate, $vars, $timezone, $locale, protectErrors: $protectErrors);
+
+            if ($template->hasError()) {
+                $template->clearError();
+                $this->di['em']->flush();
+            }
+
+            return [$ps, $pc];
+        } catch (\FOSSBilling\Core\Exception\BaseException $e) {
+            $template->setLastError($e->getMessage());
+            $template->setErrorCheckedAt(new \DateTimeImmutable());
+            $this->di['em']->flush();
+
+            throw $e;
+        }
+    }
+
+    public function resend(ActivityClientEmail $email): bool
+    {
+        $extensionService = $this->di['mod_service']('extension');
+        if ($extensionService->isExtensionActive(ExtensionType::Module->value, 'demo')) {
+            return false;
+        }
+
+        if (Environment::isTesting()) {
+            // @phpstan-ignore if.alwaysFalse
+            if (DEBUG) {
+                $this->di['logger']->withChannel('email')->info('Skipping email sending in test environment');
+            }
+
+            return true;
+        }
+
+        $clientService = $this->di['mod_service']('client');
+        $customer = $clientService->get(['id' => $email->getClientId()]);
+        $customer = $clientService->toApiArray($customer);
+
+        $systemService = $this->di['mod_service']('system');
+        $from_name = $systemService->getParamValue('company_name');
+
+        $this->sendMail($email->getRecipients(), $email->getSender(), $email->getSubject(), $email->getContentHtml(), $customer['first_name'] . ' ' . $customer['last_name'], $from_name, $email->getClientId(), null, false, false, $this->loggedAttachmentToArray($email));
+
+        $this->di['logger']->info('Resent email #{email_id}', ['email_id' => $email->getId()]);
+
+        return true;
+    }
+
+    /**
+     * @return array{content: string, name: string, mime: string}|null
+     */
+    private function loggedAttachmentToArray(ActivityClientEmail $email): ?array
+    {
+        $content = $email->getAttachmentContent();
+        if ($content === null) {
+            return null;
+        }
+
+        return [
+            'content' => $content,
+            'name' => $email->getAttachmentName() ?? 'attachment',
+            'mime' => $email->getAttachmentMime() ?? 'application/octet-stream',
+        ];
+    }
+
+    public function templateToApiArray(EmailTemplate $template, bool $deep = false): array
+    {
+        $isCustom = $this->isCustomTemplate($template);
+        [$subject, $content] = $this->getEffectiveTemplateParts($template);
+
+        $isOverridden = false;
+        if (!$isCustom) {
+            $isOverridden = $template->isOverridden();
+        }
+
+        $data = [
+            'id' => $template->getId(),
+            'action_code' => $template->getActionCode(),
+            'category' => $template->getCategory(),
+            'enabled' => $template->isEnabled(),
+            'subject' => $subject,
+            'description' => $template->getDescription(),
+            'is_custom' => $isCustom,
+            'has_default' => !$isCustom && $this->hasDefaultTemplate($template->getActionCode()),
+            'is_overridden' => $isOverridden,
+        ];
+        if ($deep) {
+            $data['content'] = $content;
+            $data['vars'] = $this->getVars($template);
+            $data['subject_override'] = $isCustom ? null : $template->getSubject();
+            $data['content_override'] = $isCustom ? null : $template->getContent();
+            $data['has_error'] = $template->hasError();
+            $data['last_error'] = $template->getLastError();
+        }
+
+        return $data;
+    }
+
+    private function templateRowToApiArray(array $template): array
+    {
+        $actionCode = (string) ($template['action_code'] ?? '');
+        $isCustom = (bool) ($template['is_custom'] ?? false);
+        $isOverridden = !$isCustom && (bool) ($template['is_overridden'] ?? false);
+        $default = (!$isCustom && $actionCode !== '') ? $this->getDefaultTemplate($actionCode) : null;
+
+        $subject = $template['subject'] ?? null;
+        $description = $template['description'] ?? null;
+        $category = $template['category'] ?? null;
+
+        if ($default !== null) {
+            $category ??= $default['category'];
+            $description ??= $default['description'];
+
+            if (!$isOverridden || $subject === null || $subject === '') {
+                $subject = $default['subject'];
+            }
+        }
+
+        return [
+            'id' => $template['id'] ?? null,
+            'action_code' => $actionCode,
+            'category' => $category,
+            'enabled' => (bool) ($template['enabled'] ?? false),
+            'subject' => $subject ?? '',
+            'description' => $description,
+            'is_custom' => $isCustom,
+            'has_default' => !$isCustom && $default !== null,
+            'is_overridden' => $isOverridden,
+            'has_error' => !empty($template['last_error']),
+            'last_error' => $template['last_error'] ?? null,
+        ];
+    }
+
+    public function updateTemplate(EmailTemplate $template, $enabled = null, $category = null, $subject = null, $content = null): bool
+    {
+        if (isset($enabled)) {
+            $template->setEnabled((bool) $enabled);
+        }
+
+        if (isset($category)) {
+            $template->setCategory($category);
+        }
+
+        $systemService = $this->di['mod_service']('System');
+        $vars = $this->getVars($template);
+
+        $isCustom = $this->isCustomTemplate($template);
+        $default = $isCustom ? null : $this->getDefaultTemplate($template->getActionCode());
+
+        if (isset($subject)) {
+            $vars['_tpl'] = $subject;
+            $systemService->renderEmailTplString($subject, $vars, null, null, $isCustom);
+            $template->setSubject($subject);
+        }
+
+        if (isset($content)) {
+            $vars['_tpl'] = $content;
+            $systemService->renderEmailTplString($content, $vars, null, null, $isCustom);
+            $template->setContent($content);
+        }
+
+        $template->clearError();
+
+        if (!$isCustom && $default !== null) {
+            $subjectMatches = $template->getSubject() === $default['subject'];
+            $contentMatches = $template->getContent() === $default['content'];
+            $template->setIsOverridden(!($subjectMatches && $contentMatches));
+        }
+
+        $this->di['em']->flush();
+        $this->di['logger']->info('Updated email template #{template_id}', ['template_id' => $template->getId()]);
+
+        return true;
+    }
+
+    /**
+     * @return int[]
+     */
+    public function getTemplateGroupIds(EmailTemplate $template): array
+    {
+        return $this->templateGroupRepository->getGroupIdsForTemplate((int) $template->getId());
+    }
+
+    public function addTemplateToGroup(EmailTemplate $template, int $groupId): bool
+    {
+        $group = $this->di['mod_service']('staff')->getAdminGroupRepository()->find($groupId);
+        if ($group === null) {
+            throw new \FOSSBilling\Core\Exception\InformationException('Staff group not found');
+        }
+
+        if ($this->templateGroupRepository->findAssociation((int) $template->getId(), $groupId) instanceof EmailTemplateGroup) {
+            return true;
+        }
+
+        $this->di['em']->persist(new EmailTemplateGroup($template, $groupId));
+        $this->di['em']->flush();
+
+        $this->di['logger']->info('Assigned email template #{template_id} to staff group #{group_id}', ['template_id' => $template->getId(), 'group_id' => $groupId]);
+
+        return true;
+    }
+
+    public function removeTemplateFromGroup(EmailTemplate $template, int $groupId): bool
+    {
+        $association = $this->templateGroupRepository->findAssociation((int) $template->getId(), $groupId);
+        if (!$association instanceof EmailTemplateGroup) {
+            return true;
+        }
+
+        $this->di['em']->remove($association);
+        $this->di['em']->flush();
+
+        $this->di['logger']->info('Removed email template #{template_id} from staff group #{group_id}', ['template_id' => $template->getId(), 'group_id' => $groupId]);
+
+        return true;
+    }
+
+    public function resetTemplateByCode($code): bool
+    {
+        $default = $this->getDefaultTemplate((string) $code);
+        if ($default === null) {
+            throw new \FOSSBilling\Core\Exception\BaseException('Email template :code does not have a file-backed default', [':code' => $code]);
+        }
+
+        $template = $this->getOrCreateTemplateByCode((string) $code, ['code' => $code]);
+        if ($this->isCustomTemplate($template)) {
+            throw new \FOSSBilling\Core\Exception\BaseException('Custom email template :code cannot be reset to a default', [':code' => $code]);
+        }
+
+        $this->resetBuiltinTemplate($template, $default);
+        $this->di['em']->flush();
+        $this->di['logger']->info('Reset email template: {action_code}', ['action_code' => $template->getActionCode()]);
+
+        return true;
+    }
+
+    public function templateCreate($actionCode, $subject, $content, $enabled = 0, $category = null): EmailTemplate
+    {
+        $systemService = $this->di['mod_service']('System');
+
+        if ($subject !== null && $subject !== '') {
+            $systemService->renderEmailTplString($subject, [], null, null, true);
+        }
+
+        if ($content !== null && $content !== '') {
+            $systemService->renderEmailTplString($content, [], null, null, true);
+        }
+
+        $template = new EmailTemplate($actionCode);
+        $template->setSubject($subject)
+            ->setEnabled((bool) $enabled)
+            ->setCategory($category)
+            ->setContent($content)
+            ->setIsCustom(true);
+
+        $em = $this->di['em'];
+        $em->persist($template);
+        $em->flush();
+
+        $this->di['logger']->info('Added new email template #{template_id}', ['template_id' => $template->getId()]);
+
+        return $template;
+    }
+
+    public function templateBatchGenerate(): bool
+    {
+        return $this->syncFileBackedTemplates();
+    }
+
+    public function templateBatchRegenerate(): bool
+    {
+        $regenerated = 0;
+
+        foreach ($this->getTemplateRepository()->findAll() as $template) {
+            if ($this->isCustomTemplate($template)) {
+                continue;
+            }
+
+            $default = $this->getDefaultTemplate($template->getActionCode());
+            if ($default === null) {
+                continue;
+            }
+
+            $this->resetBuiltinTemplate($template, $default);
+            ++$regenerated;
+        }
+
+        $this->di['em']->flush();
+        $this->di['logger']->info('Regenerated {count} existing file-backed email templates.', ['count' => $regenerated]);
+
+        return true;
+    }
+
+    private function syncFileBackedTemplates(): bool
+    {
+        $extensionService = $this->di['mod_service']('extension');
+        $templatesByCode = [];
+        foreach ($this->getTemplateRepository()->findAll() as $template) {
+            $templatesByCode[$template->getActionCode()] = $template;
+        }
+
+        $finder = new Finder();
+        $finder = $finder->files()->in(PATH_MODS . '/*/templates/email/')->name('*.html.twig');
+
+        foreach ($finder as $file) {
+            $code = $file->getBasename('.html.twig');
+            $module = strtolower(Path::getFilenameWithoutExtension(Path::getDirectory(Path::getDirectory($file->getPath()))));
+
+            // Skip if module is not active.
+            if (!$extensionService->isExtensionActive(ExtensionType::Module->value, $module)) {
+                continue;
+            }
+
+            $template = $templatesByCode[$code] ?? null;
+            $default = $this->getDefaultTemplate($code, ['code' => $code]);
+            if ($default === null) {
+                continue;
+            }
+
+            if (!$template instanceof EmailTemplate) {
+                $this->createBuiltinTemplateRecord($code, $default);
+
+                continue;
+            }
+
+            if (!$this->isCustomTemplate($template)) {
+                $this->syncBuiltinTemplate($template, $default);
+            }
+        }
+
+        $this->di['logger']->info('Synced file-backed email templates for installed modules.');
+
+        return true;
+    }
+
+    public function templateBatchDisable(): bool
+    {
+        $this->templateBatchGenerate();
+        $this->getTemplateRepository()->setAllEnabled(false);
+        $this->di['logger']->info('Disabled all email templates');
+
+        return true;
+    }
+
+    public function templateBatchEnable(): bool
+    {
+        $this->templateBatchGenerate();
+        $this->getTemplateRepository()->setAllEnabled(true);
+        $this->di['logger']->info('Enabled all email templates');
+
+        return true;
+    }
+
+    public function getTemplate(int $id): EmailTemplate
+    {
+        $template = $this->getTemplateRepository()->find($id);
+        if (!$template instanceof EmailTemplate) {
+            throw new \FOSSBilling\Core\Exception\BaseException('Email template not found');
+        }
+
+        if (!$this->isCustomTemplate($template)) {
+            $default = $this->getDefaultTemplate($template->getActionCode());
+            if ($default !== null) {
+                $this->syncBuiltinTemplate($template, $default);
+            }
+        }
+
+        return $template;
+    }
+
+    public function getTemplateList(array $data = []): array
+    {
+        $qb = $this->getTemplateRepository()->getSearchQueryBuilder($data);
+
+        $result = $this->di['pager']->paginateDoctrineQuery($qb, Options::fromArray($data));
+
+        $list = [];
+        foreach ($result['list'] as $templateRow) {
+            if ($templateRow instanceof EmailTemplate) {
+                $templateRow = $templateRow->toApiArray();
+            }
+
+            if (!is_array($templateRow)) {
+                continue;
+            }
+
+            $list[] = $this->templateRowToApiArray($templateRow);
+        }
+        $result['list'] = $list;
+
+        return $result;
+    }
+
+    public function getBrokenTemplateCount(): int
+    {
+        return $this->getTemplateRepository()->countBroken();
+    }
+
+    public function validateAllTemplates(): array
+    {
+        $templates = $this->getTemplateRepository()->findAll();
+        $results = ['valid' => 0, 'invalid' => 0, 'errors' => []];
+        $systemService = $this->di['mod_service']('System');
+
+        foreach ($templates as $template) {
+            $error = null;
+
+            try {
+                [$subjectTemplate, $contentTemplate] = $this->getEffectiveTemplateParts($template);
+                $vars = $this->getVars($template);
+                $systemService->renderEmailTplString($contentTemplate, $vars, null, null, $template->isCustom());
+                $systemService->renderEmailTplString($subjectTemplate, $vars, null, null, $template->isCustom());
+            } catch (\Throwable $e) {
+                $error = $e->getMessage();
+            }
+
+            if ($error !== null) {
+                $template->setLastError($error);
+                $template->setErrorCheckedAt(new \DateTimeImmutable());
+                $this->di['logger']->warning(
+                    'Email template validation failed for "{action_code}": {error}',
+                    ['action_code' => $template->getActionCode(), 'error' => $error]
+                );
+                ++$results['invalid'];
+                $results['errors'][] = [
+                    'id' => $template->getId(),
+                    'action_code' => $template->getActionCode(),
+                    'error' => $error,
+                ];
+            } else {
+                if ($template->hasError()) {
+                    $template->clearError();
+                }
+                ++$results['valid'];
+            }
+        }
+
+        $this->di['em']->flush();
+
+        return $results;
+    }
+
+    /**
+     * Sends emails from queue, respecting the configured time limit and emails per cron limit.
+     * If an email fails to be sent, it will be skipped and retried on the next cron run until the retry limit is reached.
+     */
+    public function batchSend(): void
+    {
+        $mod = $this->di['mod']('email');
+        $settings = $mod->getConfig();
+
+        $time_limit = ($settings['time_limit'] ?? 5) * 60;
+        $sendPerCron = $settings['queue_once'] ?? 0;
+
+        $start = time();
+
+        $mailQueue = $this->getQueuedEmailRepository()->findDueBatch((int) $sendPerCron);
+
+        foreach ($mailQueue as $email) {
+            $this->_sendFromQueue($email);
+            if ($time_limit && time() - $start > $time_limit) {
+                break;
+            }
+        }
+    }
+
+    /**
+     * @return array{content: string, name: string, mime: string}|null
+     */
+    private function queuedAttachmentToArray(QueuedEmail $queue): ?array
+    {
+        $content = $queue->getAttachmentContent();
+        if ($content === null) {
+            return null;
+        }
+
+        return [
+            'content' => $content,
+            'name' => $queue->getAttachmentName() ?? 'attachment',
+            'mime' => $queue->getAttachmentMime() ?? 'application/octet-stream',
+        ];
+    }
+
+    /**
+     * @return string[]
+     */
+    private function parseBccAddresses(string $value): array
+    {
+        $addresses = [];
+        foreach (explode(',', $value) as $address) {
+            $address = trim($address);
+            if ($address === '') {
+                continue;
+            }
+
+            if (filter_var($address, FILTER_VALIDATE_EMAIL)) {
+                $addresses[] = $address;
+            } else {
+                $this->di['logger']->withChannel('email')->warning('Skipping invalid Bcc address: ' . $address);
+            }
+        }
+
+        return $addresses;
+    }
+
+    private function _sendFromQueue(QueuedEmail $queue, bool $throw_exceptions = false, bool $sensitiveDelivery = false): bool
+    {
+        $extensionService = $this->di['mod_service']('extension');
+        if ($extensionService->isExtensionActive(ExtensionType::Module->value, 'demo')) {
+            return false;
+        }
+        $queue->setStatus('sending');
+        if (!$sensitiveDelivery) {
+            $this->di['em']->flush();
+        }
+
+        $queue->setContent($queue->getContent() . PHP_EOL);
+
+        $mod = $this->di['mod']('email');
+        $settings = $mod->getConfig();
+        $log = isset($settings['log_enabled']) && $settings['log_enabled'];
+
+        $transport = $settings['mailer'] ?? 'sendmail';
+        $sender = [
+            'email' => $queue->getSender(),
+            'name' => $queue->getFromName(),
+        ];
+        $recipient = [
+            'email' => $queue->getRecipient(),
+            'name' => $queue->getToName(),
+        ];
+
+        $attachment = $this->queuedAttachmentToArray($queue);
+
+        try {
+            $mail = new \FOSSBilling\Core\Mail($sender, $recipient, $queue->getSubject(), $queue->getContent(), $transport, $settings['custom_dsn'] ?? null);
+
+            if ($attachment !== null) {
+                $mail->attach($attachment['content'], $attachment['name'], $attachment['mime']);
+            }
+
+            if (!empty($settings['reply_to'])) {
+                if (filter_var($settings['reply_to'], FILTER_VALIDATE_EMAIL)) {
+                    $mail->addReplyTo($settings['reply_to']);
+                } else {
+                    $this->di['logger']->withChannel('email')->warning('Skipping invalid Reply-To address: ' . $settings['reply_to']);
+                }
+            }
+
+            if (!empty($settings['bcc_email']) && !$sensitiveDelivery) {
+                $this->validatedBccAddresses ??= $this->parseBccAddresses((string) $settings['bcc_email']);
+                $bccAddresses = $this->validatedBccAddresses;
+                if ($bccAddresses !== []) {
+                    $mail->addBcc($bccAddresses);
+                }
+            }
+
+            if (!Environment::isProduction()) {
+                $this->di['logger']->withChannel('email')->info('Skip email sending. Application ENV: ' . Environment::getCurrentEnvironment());
+
+                return true;
+            }
+
+            $mail->send($settings);
+
+            // It sent without causing an exception (error), so we are safe to log it now
+            // Secret emails are never logged: ask for a new link instead.
+            if ($log && !$sensitiveDelivery) {
+                $activityService = $this->di['mod_service']('activity');
+                $activityService->logEmail($queue->getSubject(), $queue->getClientId(), $queue->getSender(), $queue->getRecipient(), $queue->getContent(), null, $attachment);
+            }
+
+            if (!$sensitiveDelivery) {
+                try {
+                    $this->di['em']->remove($queue);
+                    $this->di['em']->flush();
+                } catch (\Exception $e) {
+                    $this->di['logger']->withChannel('email')->error($e->getMessage());
+                }
+            }
+        } catch (\Exception $e) {
+            $message = $sensitiveDelivery ? 'Secret email delivery failed; request a new link' : $e->getMessage();
+            $this->di['logger']->withChannel('email')->error($message);
+
+            // Secret messages exist only in memory; failure cannot queue a retry.
+            if ($sensitiveDelivery) {
+                if ($throw_exceptions) {
+                    throw new \FOSSBilling\Core\Exception\BaseException($message, protected: true);
+                }
+
+                return false;
+            }
+
+            if ($queue->getPriority()) {
+                $queue->setPriority($queue->getPriority() - 1);
+            }
+
+            $queue->setStatus(QueuedEmail::STATUS_FAILED);
+            $queue->setTries($queue->getTries() + 1);
+            $this->di['em']->flush();
+
+            $maxTries = $settings['cancel_after'] ?? 5;
+            if ($queue->getTries() > $maxTries) {
+                // The email failed to send after the max number of tries. This might be because of a server error, so let's be sure to log it which gives the client the ability to resend it.
+                if ($log) {
+                    $activityService = $this->di['mod_service']('activity');
+                    $activityService->logEmail($queue->getSubject(), $queue->getClientId(), $queue->getSender(), $queue->getRecipient(), $queue->getContent(), null, $attachment);
+                }
+                $this->di['em']->remove($queue);
+                $this->di['em']->flush();
+            }
+
+            if ($throw_exceptions) {
+                // If the error message is long, truncate it and inform the user the rest is in the error log.
+                $truncated = (strlen($message) > 350) ? __trans('Error message truncated due to length, please check the error log for the complete message: ') . substr($message, 0, 350) . '...' : $message;
+
+                throw new \FOSSBilling\Core\Exception\BaseException($truncated);
+            }
+        }
+
+        return true;
+    }
+}

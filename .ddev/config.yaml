@@ -1,0 +1,38 @@
+name: fossbilling
+type: php
+docroot: src
+php_version: "8.3"
+nodejs_version: "26"
+webserver_type: nginx-fpm
+xdebug_enabled: false
+additional_hostnames: ["fossbilling.dev"]
+database:
+    type: mariadb
+    version: "11.8"
+hooks:
+    post-start:
+        - exec: .ddev/post-start.sh
+upload_dirs:
+    - data/uploads
+    - ../node_modules
+use_dns_when_possible: true
+composer_version: "2"
+web_environment:
+    - IS_DDEV=true
+    - APP_ENV=dev
+corepack_enable: false
+omit_containers: ["ddev-ssh-agent"]
+
+# Key features of DDEV's config.yaml:
+
+# working_dir:
+#   web: /var/www/html
+#   db: /home
+# would set the default working directory for the web and db services.
+# These values specify the destination directory for ddev ssh and the
+# directory in which commands passed into ddev exec are run.
+
+# share_default_provider: ngrok
+# The default share provider to use for "ddev share"
+# Defaults to global configuration, usually "ngrok"
+# Can be "ngrok" or "cloudflared" or the name of a custom provider from .ddev/share-providers/

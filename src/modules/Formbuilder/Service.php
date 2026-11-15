@@ -1,0 +1,411 @@
+<?php
+
+declare(strict_types=1);
+/**
+ * Copyright 2022-2025 FOSSBilling
+ * SPDX-License-Identifier: Apache-2.0.
+ *
+ * @copyright FOSSBilling (https://www.fossbilling.org)
+ * @license http://www.apache.org/licenses/LICENSE-2.0 Apache-2.0
+ */
+
+namespace Box\Mod\Formbuilder;
+
+use Doctrine\DBAL\Connection;
+use FOSSBilling\Core\Container\InjectionAwareInterface;
+
+class Service implements InjectionAwareInterface
+{
+    protected ?\Pimple\Container $di = null;
+
+    public function setDi(\Pimple\Container $di): void
+    {
+        $this->di = $di;
+    }
+
+    public function getDi(): ?\Pimple\Container
+    {
+        return $this->di;
+    }
+
+    public function getModulePermissions(): array
+    {
+        return [
+            'view' => [
+                'type' => 'bool',
+                'display_name' => __trans('View forms'),
+                'description' => __trans('Allows the staff member to view order forms and their fields.'),
+            ],
+            'manage' => [
+                'type' => 'bool',
+                'display_name' => __trans('Manage forms'),
+                'description' => __trans('Allows the staff member to create, update, and delete order forms and fields.'),
+            ],
+            'manage_settings' => [],
+        ];
+    }
+
+    private function getConnection(): Connection
+    {
+        return $this->di['em']->getConnection();
+    }
+
+    public function getFormFieldsTypes(): array
+    {
+        return [
+            'text' => 'Text Input',
+            'url' => 'URL Input',
+            'select' => 'Dropdown',
+            'radio' => 'Radio Select',
+            'checkbox' => 'Checkbox',
+            'textarea' => 'Text Area',
+        ];
+    }
+
+    public function isValidFieldType(string $type): bool
+    {
+        return array_key_exists($type, $this->getFormFieldsTypes());
+    }
+
+    public function validateUrlField(string $value): bool
+    {
+        if (empty($value)) {
+            return true;
+        }
+
+        if (!filter_var($value, FILTER_VALIDATE_URL)) {
+            return false;
+        }
+
+        $host = parse_url($value, PHP_URL_HOST);
+        $host ??= $value;
+
+        return (bool) preg_match('/\.[a-zA-Z]{2,}$/', $host);
+    }
+
+    public function isArrayUnique($array): bool
+    {
+        $unique = array_unique($array);
+
+        return \FOSSBilling\Core\Utils\Arr::safeCount($array) === count($unique);
+    }
+
+    public function addNewForm($data): int
+    {
+        $style = [
+            'type' => $data['type'] ?? 'horizontal',
+            'show_title' => $data['show_title'] ?? '0',
+        ];
+
+        $this->getConnection()->insert('form', [
+            'name' => $data['name'],
+            'style' => $style,
+            'created_at' => date('Y-m-d H:i:s'),
+            'updated_at' => date('Y-m-d H:i:s'),
+        ], ['style' => \Doctrine\DBAL\Types\Types::JSON]);
+
+        $formId = (int) $this->getConnection()->lastInsertId();
+        $this->di['logger']->info('Created new form {form_name} with id {form_id}', ['form_name' => $data['name'], 'form_id' => $formId]);
+
+        return $formId;
+    }
+
+    public function addNewField($field): int
+    {
+        if (array_key_exists('options', $field) && !is_array($field['options'])) {
+            throw new \FOSSBilling\Core\Exception\InformationException('Field options must be an array.');
+        }
+        $fieldNumber = $this->getFormFieldsCount($field['form_id']) + 1;
+        $types = $this->getFormFieldsTypes();
+        $type = $field['type'];
+
+        $label = $field['label'] ?? $types[$type] . ' ' . $fieldNumber;
+        $name = $field['name'] ?? $this->slugify('new_' . $type) . '_' . $fieldNumber;
+
+        if (in_array($type, ['select', 'checkbox', 'radio'], true) && !isset($field['options'])) {
+            $field['options'] = ['First option' => '1', 'Second option' => '2', 'Third option' => '3'];
+        }
+
+        if ($field['type'] == 'textarea' && !isset($field['options'])) {
+            $field['options'] = ['height' => '100', 'width' => '300'];
+        }
+
+        $this->getConnection()->insert('form_field', [
+            'form_id' => $field['form_id'],
+            'name' => $name,
+            'label' => $label,
+            'hide_label' => $field['hide_label'] ?? null,
+            'description' => $field['description'] ?? null,
+            'type' => $field['type'],
+            'default_value' => $field['default_value'] ?? null,
+            'required' => $field['required'] ?? null,
+            'hidden' => $field['hidden'] ?? null,
+            'readonly' => $field['readonly'] ?? null,
+            'options' => $field['options'] ?? null,
+            'prefix' => $field['prefix'] ?? null,
+            'suffix' => $field['suffix'] ?? null,
+            'show_initial' => $field['show_initial'] ?? null,
+            'show_middle' => $field['show_middle'] ?? null,
+            'show_prefix' => $field['show_prefix'] ?? null,
+            'show_suffix' => $field['show_suffix'] ?? null,
+            'text_size' => $field['text_size'] ?? null,
+            'created_at' => date('Y-m-d H:i:s'),
+            'updated_at' => date('Y-m-d H:i:s'),
+        ], ['options' => \Doctrine\DBAL\Types\Types::JSON, 'default_value' => \Doctrine\DBAL\Types\Types::JSON]);
+
+        $fieldId = (int) $this->getConnection()->lastInsertId();
+        $this->di['logger']->info('Added new field {field_id} to form {form_id}', ['field_id' => $fieldId, 'form_id' => $field['form_id']]);
+
+        return $fieldId;
+    }
+
+    private function slugify($text): string
+    {
+        $text = preg_replace('~[^\\pL\d]+~u', '_', (string) $text);
+        $text = trim((string) $text, '_');
+        $text = iconv('utf-8', 'us-ascii//TRANSLIT', $text);
+        $text = strtolower($text);
+        $text = preg_replace('~[^\-\w]+~', '', $text);
+
+        if (is_numeric(substr((string) $text, 0, 1))) {
+            throw new \FOSSBilling\Core\Exception\InformationException('Field name cannot start with number.', null, 1649);
+        }
+
+        if (empty($text)) {
+            throw new \FOSSBilling\Core\Exception\InformationException('Field name cannot be empty. Please make sure it is not empty and does not contain special characters.', null, 3502);
+        }
+
+        return $text;
+    }
+
+    public function updateField(array $field): int
+    {
+        if (array_key_exists('options', $field) && !is_array($field['options'])) {
+            throw new \FOSSBilling\Core\Exception\InformationException('Field options must be an array.');
+        }
+        $fieldId = (int) $field['id'];
+        $label = $field['label'] ?? 'New field';
+        $name = $this->slugify($field['name']);
+
+        $currentField = $this->getField($fieldId);
+        $field['form_id'] = $currentField['form_id'] ?? null;
+
+        if ($this->formFieldNameExists([
+            'form_id' => $field['form_id'],
+            'field_name' => $field['name'],
+            'field_id' => $fieldId,
+        ])) {
+            throw new \FOSSBilling\Core\Exception\InformationException('Unfortunately field with this name exists in this form already. Form must have different field names.', null, 7628);
+        }
+
+        $field['options'] ??= null;
+
+        if (isset($field['type'])) {
+            if ($field['type'] == 'checkbox' || $field['type'] == 'radio' || $field['type'] == 'select') {
+                if (!$this->isArrayUnique(array_filter($field['values'], fn ($v): bool => strlen((string) $v) > 0))) {
+                    throw new \FOSSBilling\Core\Exception\InformationException(ucfirst($field['type']) . ' values must be unique', null, 1597);
+                }
+
+                if (!$this->isArrayUnique(array_filter($field['labels'], fn ($v): bool => strlen((string) $v) > 0))) {
+                    throw new \FOSSBilling\Core\Exception\InformationException(ucfirst($field['type']) . ' labels must be unique', null, 1598);
+                }
+
+                $field['options'] = array_combine($field['labels'], $field['values']);
+                $field['options'] = array_filter($field['options'], fn ($v): bool => strlen((string) $v) > 0);
+            }
+
+            if ($field['type'] == 'textarea') {
+                if (\FOSSBilling\Core\Utils\Arr::safeCount($field['textarea_size']) != count(array_filter($field['textarea_size'], is_numeric(...)))) {
+                    throw new \FOSSBilling\Core\Exception\InformationException('Textarea size options must be integer values', null, 3510);
+                }
+
+                $field['options'] = array_combine($field['textarea_option'], $field['textarea_size']);
+            }
+        }
+
+        $this->getConnection()->update('form_field', [
+            'name' => $name,
+            'label' => $label,
+            'hide_label' => $field['hide_label'] ?? null,
+            'description' => $field['description'] ?? null,
+            'default_value' => $field['default_value'] ?? null,
+            'required' => $field['required'] ?? null,
+            'hidden' => $field['hidden'] ?? null,
+            'readonly' => $field['readonly'] ?? null,
+            'options' => $field['options'],
+            'prefix' => $field['prefix'] ?? null,
+            'suffix' => $field['suffix'] ?? null,
+            'show_initial' => $field['show_initial'] ?? null,
+            'show_middle' => $field['show_middle'] ?? null,
+            'show_prefix' => $field['show_prefix'] ?? null,
+            'show_suffix' => $field['show_suffix'] ?? null,
+            'text_size' => $field['text_size'] ?? null,
+            'updated_at' => date('Y-m-d H:i:s'),
+        ], ['id' => $fieldId], ['options' => \Doctrine\DBAL\Types\Types::JSON, 'default_value' => \Doctrine\DBAL\Types\Types::JSON]);
+
+        $this->di['logger']->info('Updated custom form {field_id}', ['field_id' => $fieldId]);
+
+        return $fieldId;
+    }
+
+    public function getForm(int $formId): array
+    {
+        $result = $this->getConnection()->executeQuery(
+            'SELECT * FROM form WHERE id = ?',
+            [$formId]
+        )->fetchAssociative();
+
+        if ($result === false) {
+            throw new \FOSSBilling\Core\Exception\InformationException('Form was not found');
+        }
+
+        $result['style'] = json_decode($result['style'] ?? 'null', true, 512, JSON_THROW_ON_ERROR);
+        if (!is_array($result['style'])) {
+            $result['style'] = ['type' => 'default', 'show_title' => '1'];
+        }
+        $result['fields'] = $this->getFormFields($result['id']);
+
+        return $result;
+    }
+
+    public function getFormFields($formId)
+    {
+        return $this->fieldsJsonDecode($this->getConnection()->executeQuery(
+            'SELECT * FROM form_field WHERE form_id = ? ORDER BY id ASC',
+            [$formId]
+        )->fetchAllAssociative());
+    }
+
+    private function fieldsJsonDecode($fields)
+    {
+        foreach ($fields as &$row) {
+            $row['options'] = json_decode($row['options'] ?? 'null', true, 512, JSON_THROW_ON_ERROR) ?? [];
+            $row['default_value'] = json_decode($row['default_value'] ?? 'null', true, 512, JSON_THROW_ON_ERROR);
+        }
+
+        return $fields;
+    }
+
+    public function getFormFieldsCount($form_id): int
+    {
+        return (int) $this->getConnection()->executeQuery(
+            'SELECT COUNT(*) FROM form_field WHERE form_id = ?',
+            [$form_id]
+        )->fetchOne();
+    }
+
+    /**
+     * @return mixed[]
+     */
+    public function getFormPairs(): array
+    {
+        $pairs = [];
+        $rows = $this->getConnection()->executeQuery('SELECT id, name FROM form')->fetchAllAssociative();
+        foreach ($rows as $row) {
+            $pairs[$row['id']] = $row['name'];
+        }
+
+        return $pairs;
+    }
+
+    public function getField($fieldId)
+    {
+        $result = $this->getConnection()->executeQuery(
+            'SELECT * FROM form_field WHERE id = ?',
+            [$fieldId]
+        )->fetchAssociative();
+
+        if ($result === false) {
+            throw new \FOSSBilling\Core\Exception\InformationException('Field was not found');
+        }
+
+        $required = [
+            'id' => 'Field was not found',
+        ];
+        $this->di['validator']->checkRequiredParamsForArray($required, $result, null, 2575);
+
+        $result['options'] = json_decode($result['options'] ?? 'null', true, 512, JSON_THROW_ON_ERROR) ?? [];
+        $result['default_value'] = json_decode($result['default_value'] ?? 'null', true, 512, JSON_THROW_ON_ERROR);
+
+        return $result;
+    }
+
+    public function removeForm($form_id): bool
+    {
+        $this->getConnection()->executeStatement('DELETE FROM form_field WHERE form_id = ?', [$form_id]);
+        $this->getConnection()->executeStatement('DELETE FROM form WHERE id = ?', [$form_id]);
+        $this->getConnection()->executeStatement('UPDATE product SET form_id = NULL WHERE form_id = ?', [$form_id]);
+        $this->getConnection()->executeStatement('UPDATE client_order SET form_id = NULL WHERE form_id = ?', [$form_id]);
+
+        $this->di['logger']->info('Deleted custom form {form_id}', ['form_id' => $form_id]);
+
+        return true;
+    }
+
+    public function removeField($data): bool
+    {
+        $deleted = $this->getConnection()->executeStatement('DELETE FROM form_field WHERE id = ?', [$data['id']]);
+        if ($deleted === 0) {
+            throw new \FOSSBilling\Core\Exception\InformationException('Field was not found');
+        }
+
+        $this->di['logger']->info('Deleted custom field {data_id}', ['data_id' => $data['id']]);
+
+        return true;
+    }
+
+    public function formFieldNameExists($data): bool
+    {
+        return (int) $this->getConnection()->executeQuery(
+            'SELECT COUNT(*) FROM form_field WHERE form_id = ? AND name = ? AND id != ?',
+            [$data['form_id'], $data['field_name'], $data['field_id']]
+        )->fetchOne() > 0;
+    }
+
+    public function getForms()
+    {
+        return $this->getConnection()->executeQuery(
+            'SELECT f.id, f.name, COUNT(p.id) AS product_count, COUNT(co.id) AS order_count
+            FROM form f
+            LEFT JOIN product p ON f.id = p.form_id
+            LEFT JOIN client_order co ON f.id = co.form_id
+            GROUP BY f.id'
+        )->fetchAllAssociative();
+    }
+
+    public function duplicateForm($data): int
+    {
+        $fields = $this->getFormFields($data['form_id']);
+        $newFormId = $this->addNewForm([
+            'name' => $data['name'],
+        ]);
+
+        foreach ($fields as $fieldData) {
+            $fieldData['form_id'] = $newFormId;
+            $this->addNewField($fieldData);
+        }
+
+        $this->di['logger']->info('Copied form with id {form_id} to new form {form_name} with id {new_form_id}', ['form_id' => $data['form_id'], 'form_name' => $data['name'], 'new_form_id' => $newFormId]);
+
+        return $newFormId;
+    }
+
+    public function updateFormSettings($data): bool
+    {
+        $style = [
+            'type' => $data['type'],
+            'show_title' => $data['show_title'] ?? '1',
+        ];
+
+        $this->getConnection()->update('form', [
+            'name' => $data['form_name'],
+            'style' => $style,
+            'updated_at' => date('Y-m-d H:i:s'),
+        ], ['id' => $data['form_id']], ['style' => \Doctrine\DBAL\Types\Types::JSON]);
+
+        $this->di['logger']->info('Updated form {form_id} name to {form_name}', ['form_id' => $data['form_id'], 'form_name' => $data['form_name']]);
+        $this->di['logger']->info('Updated form {form_id} type to {form_type}', ['form_id' => $data['form_id'], 'form_type' => $data['type']]);
+
+        return true;
+    }
+}

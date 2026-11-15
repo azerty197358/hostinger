@@ -1,0 +1,104 @@
+name: Bug Report
+description: Report reproducible behavior that is not working as expected.
+title: "[Bug] "
+labels: ["bug"]
+type: bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug.
+
+        Before submitting, please search existing issues. If you need help with installation, configuration, or general troubleshooting, use Discord instead. If this may be a security issue, report it privately through the security policy.
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Preflight Checklist
+      options:
+        - label: I have searched existing issues and confirmed this has not already been reported.
+          required: true
+        - label: This is not a question, configuration problem, or support request.
+          required: true
+        - label: This is not a security vulnerability.
+          required: true
+  - type: input
+    id: version
+    attributes:
+      label: FOSSBilling Version
+      description: Include the exact version. You can usually find it at /api/guest/system/version on your installation.
+      placeholder: "0.7.2"
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Affected Area
+      description: Select the area that best matches the problem.
+      options:
+        - Admin Panel
+        - Client Area
+        - API
+        - Installation or Upgrade
+        - Payments and Invoicing
+        - Email and Notifications
+        - Extension or Module
+        - Documentation
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: summary
+    attributes:
+      label: What Happened?
+      description: Describe the bug and the behavior you observed.
+      placeholder: "When I ..., FOSSBilling ..."
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to Reproduce
+      description: Provide exact steps so someone else can reproduce the issue.
+      placeholder: |
+        1. Go to ...
+        2. Click ...
+        3. Enter ...
+        4. See ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+      description: Explain what you expected to happen instead.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Provide the details that apply to your installation.
+      value: |
+        - PHP Version:
+        - Database Type and Version:
+        - Web Server:
+        - Browser:
+        - Installation Method:
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant Logs
+      description: Paste relevant log output, error messages, or stack traces. Remove secrets, tokens, passwords, and private customer data first.
+      render: shell
+  - type: textarea
+    id: media
+    attributes:
+      label: Screenshots or Screen Recordings
+      description: Drag and drop screenshots or recordings that show the problem, if applicable.
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional Context
+      description: Add links, related issues, recent changes, or anything else that may help.

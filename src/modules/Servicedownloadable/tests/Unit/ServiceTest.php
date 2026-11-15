@@ -1,0 +1,393 @@
+<?php
+
+/**
+ * Copyright 2022-2026 FOSSBilling
+ * SPDX-License-Identifier: Apache-2.0.
+ *
+ * @copyright FOSSBilling (https://www.fossbilling.org)
+ * @license http://www.apache.org/licenses/LICENSE-2.0 Apache-2.0
+ */
+
+declare(strict_types=1);
+
+use Box\Mod\Order\Entity\Order;
+use Box\Mod\Order\Service as OrderService;
+use Box\Mod\Product\Entity\Product;
+use Box\Mod\Servicedownloadable\Entity\ServiceDownloadable;
+use Box\Mod\Servicedownloadable\Entity\ServiceDownloadableFile;
+use Box\Mod\Servicedownloadable\Service;
+use Doctrine\DBAL\Connection;
+use Doctrine\ORM\EntityManagerInterface;
+use FOSSBilling\Core\Http\ResponseFactory;
+use Symfony\Component\HttpFoundation\File\UploadedFile;
+
+use function Tests\Helpers\container;
+use function Tests\Helpers\createEntity;
+
+function serviceDownloadableCreateProductEntity(?int $id = null, ?array $config = null): Product
+{
+    $product = new Product();
+    if ($id !== null) {
+        $reflection = new ReflectionProperty($product, 'id');
+        $reflection->setValue($product, $id);
+    }
+    if ($config !== null) {
+        $product->setConfig($config);
+    }
+
+    return $product;
+}
+
+test('action delete', function (): void {
+    $service = new Service();
+    $clientOrderModel = createEntity(Order::class);
+
+    $orderServiceMock = Mockery::mock(OrderService::class);
+    $downloadable = new ServiceDownloadable();
+    $orderServiceMock->shouldReceive('getOrderService')->atLeast()->once()->andReturn($downloadable);
+    $emMock = Mockery::mock(EntityManagerInterface::class);
+    $emMock->shouldReceive('remove')->once()->with($downloadable);
+    $emMock->shouldReceive('flush')->once();
+
+    $di = container();
+    $di['em'] = $emMock;
+    $di['mod_service'] = $di->protect(fn (): Mockery\MockInterface => $orderServiceMock);
+
+    $service->setDi($di);
+    $service->action_delete($clientOrderModel);
+});
+
+test('save product config', function (): void {
+    $service = new Service();
+    $data = [
+        'update_orders' => true,
+    ];
+
+    $productModel = serviceDownloadableCreateProductEntity(config: ['files' => []]);
+    $emMock = Mockery::mock(EntityManagerInterface::class);
+    $emMock->shouldReceive('flush')->once();
+
+    $di = new Pimple\Container();
+    $di['em'] = $emMock;
+
+    $service->setDi($di);
+    $result = $service->saveProductConfig($productModel, $data);
+
+    expect($result)->toBeBool();
+    expect($result)->toBeTrue();
+
+    $updatedConfig = $productModel->getConfig();
+    expect($updatedConfig)->toBeArray();
+    expect($updatedConfig['files'])->toBe([]);
+    expect($updatedConfig['update_orders'])->toBeTrue();
+    expect($productModel->getUpdatedAt())->not->toBeNull();
+});
+
+test('save product config with existing config', function (): void {
+    $service = new Service();
+    $data = [
+        'update_orders' => false,
+    ];
+
+    $productModel = serviceDownloadableCreateProductEntity(config: ['files' => [], 'update_orders' => true]);
+    $emMock = Mockery::mock(EntityManagerInterface::class);
+    $emMock->shouldReceive('flush')->once();
+
+    $di = new Pimple\Container();
+    $di['em'] = $emMock;
+
+    $service->setDi($di);
+    $result = $service->saveProductConfig($productModel, $data);
+
+    expect($result)->toBeBool();
+    expect($result)->toBeTrue();
+
+    $updatedConfig = $productModel->getConfig();
+    expect($updatedConfig)->toBeArray();
+    expect($updatedConfig['files'])->toBe([]);
+    expect($updatedConfig['update_orders'])->toBeFalse();
+    expect($productModel->getUpdatedAt())->not->toBeNull();
+});
+
+test('creates a downloadable service with all snapshotted files', function (): void {
+    $service = new Service();
+    $order = createEntity(Order::class, [
+        'id' => 10,
+        'client_id' => 20,
+        'config' => [
+            'files' => [
+                [
+                    'id' => str_repeat('a', 32),
+                    'filename' => 'installer.zip',
+                    'stored_filename' => str_repeat('b', 64),
+                    'label' => 'Installer',
+                    'description' => 'Application files',
+                ],
+                [
+                    'id' => str_repeat('c', 32),
+                    'filename' => 'manual.pdf',
+                    'stored_filename' => str_repeat('d', 64),
+                    'label' => 'Manual',
+                    'description' => null,
+                ],
+            ],
+        ],
+    ]);
+
+    $emMock = Mockery::mock(EntityManagerInterface::class);
+    $emMock->shouldReceive('persist')->once()->with(Mockery::on(
+        static fn (ServiceDownloadable $downloadable): bool => $downloadable->getClientId() === 20 && $downloadable->getFiles()->count() === 2,
+    ));
+    $emMock->shouldReceive('flush')->once();
+    $di = container();
+    $di['em'] = $emMock;
+    $service->setDi($di);
+
+    $downloadable = $service->action_create($order);
+
+    expect($downloadable->getFiles())->toHaveCount(2)
+        ->and($downloadable->getFiles()->first())->toBeInstanceOf(ServiceDownloadableFile::class)
+        ->and($downloadable->getFiles()->first()->getLabel())->toBe('Installer');
+});
+
+test('removes an order file and its config in one Doctrine transaction', function (): void {
+    $file = new ServiceDownloadableFile(str_repeat('a', 32), 'file.zip', str_repeat('b', 64));
+    (new ReflectionProperty($file, 'id'))->setValue($file, 2);
+    $downloadable = new ServiceDownloadable();
+    $downloadable->addFile($file);
+
+    $order = createEntity(Order::class, [
+        'id' => 10,
+        'config' => ['files' => [[
+            'id' => str_repeat('a', 32),
+            'filename' => 'file.zip',
+            'stored_filename' => str_repeat('b', 64),
+        ]]],
+    ]);
+
+    $connection = Mockery::mock(Connection::class);
+    $connection->shouldReceive('update')
+        ->once()
+        ->with('client_order', Mockery::on(static fn (array $data): bool => $data['config'] === ['files' => []]
+            && is_string($data['updated_at'])), ['id' => 10], ['config' => Doctrine\DBAL\Types\Types::JSON]);
+
+    $repository = Mockery::mock(Box\Mod\Servicedownloadable\Repository\ServiceDownloadableFileRepository::class);
+    $repository->shouldReceive('isStoredFilenameReferenced')->once()->andReturnTrue();
+
+    $em = Mockery::mock(EntityManagerInterface::class);
+    $em->shouldReceive('wrapInTransaction')
+        ->once()
+        ->andReturnUsing(static fn (callable $callback): mixed => $callback());
+    $em->shouldReceive('getConnection')->once()->andReturn($connection);
+    $em->shouldReceive('getRepository')->once()->with(ServiceDownloadableFile::class)->andReturn($repository);
+
+    $di = container();
+    $di['em'] = $em;
+    $service = new Service();
+    $service->setDi($di);
+
+    expect($service->removeOrderFile($downloadable, $order, 2))->toBeTrue()
+        ->and($downloadable->getFiles())->toHaveCount(0)
+        ->and($order->config)->toBe(['files' => []]);
+});
+
+test('rejects duplicate file IDs in order configuration', function (): void {
+    $service = new Service();
+    $file = [
+        'id' => str_repeat('a', 32),
+        'filename' => 'installer.zip',
+        'stored_filename' => str_repeat('b', 64),
+    ];
+    $data = ['files' => [$file, $file]];
+
+    expect(fn () => $service->validateOrderData($data))
+        ->toThrow(FOSSBilling\Core\Exception\BaseException::class, 'duplicate file IDs');
+});
+
+test('save product config with no existing config', function (): void {
+    $service = new Service();
+    $data = [
+        'update_orders' => true,
+    ];
+
+    $productModel = serviceDownloadableCreateProductEntity();
+    $emMock = Mockery::mock(EntityManagerInterface::class);
+    $emMock->shouldReceive('flush')->once();
+
+    $di = new Pimple\Container();
+    $di['em'] = $emMock;
+
+    $service->setDi($di);
+    $result = $service->saveProductConfig($productModel, $data);
+
+    expect($result)->toBeBool();
+    expect($result)->toBeTrue();
+
+    $updatedConfig = $productModel->getConfig();
+    expect($updatedConfig)->toBeArray();
+    expect($updatedConfig)->toHaveKey('update_orders');
+    expect($updatedConfig['update_orders'])->toBeTrue();
+    expect($productModel->getUpdatedAt())->not->toBeNull();
+});
+
+test('validate file upload allows known extension with octet stream mime', function (): void {
+    $service = new Service();
+    $service->setDi(container());
+
+    $file = Mockery::mock(UploadedFile::class)->shouldIgnoreMissing();
+    $file->shouldReceive('getClientOriginalExtension')->andReturn('exe');
+    $file->shouldReceive('getClientOriginalName')->andReturn('installer.exe');
+    $file->shouldReceive('getMimeType')->andReturn('application/octet-stream');
+
+    $reflection = new ReflectionMethod(Service::class, 'validateFileUpload');
+    $reflection->invoke($service, $file);
+
+    expect(true)->toBeTrue();
+});
+
+test('validate file upload rejects unknown extension', function (): void {
+    $service = new Service();
+    $service->setDi(container());
+
+    $file = Mockery::mock(UploadedFile::class)->shouldIgnoreMissing();
+    $file->shouldReceive('getClientOriginalExtension')->andReturn('php');
+    $file->shouldReceive('getClientOriginalName')->andReturn('shell.php');
+    $file->shouldReceive('getMimeType')->andReturn('application/x-httpd-php');
+
+    $reflection = new ReflectionMethod(Service::class, 'validateFileUpload');
+
+    expect(fn (): mixed => $reflection->invoke($service, $file))
+        ->toThrow(FOSSBilling\Core\Exception\BaseException::class);
+});
+
+test('clientSettableConfigKeys returns the downloadable allowlist', function (): void {
+    $service = new Service();
+    $allowed = $service->clientSettableConfigKeys();
+
+    expect($allowed)->toBeArray();
+    expect($allowed)->toContain('period');
+    expect($allowed)->toContain('quantity');
+    // `files` is admin-controlled and must not be client-settable.
+    expect($allowed)->not->toContain('files');
+});
+
+test('attachOrderConfig merges admin config over client data (admin wins)', function (): void {
+    $service = new Service();
+
+    // Admin product config carries the authoritative `files` list plus an
+    // admin-controlled flag (`update_orders`). Client input also carries a
+    // `update_orders` value and a `files` list - both must lose to admin.
+    $fileDefinition = [
+        'id' => str_repeat('a', 32),
+        'filename' => 'installer.zip',
+        'stored_filename' => str_repeat('b', 64),
+        'label' => 'Installer',
+        'description' => 'Application files',
+    ];
+
+    $productModel = serviceDownloadableCreateProductEntity(config: [
+        'files' => [$fileDefinition],
+        'update_orders' => true,
+    ]);
+
+    $clientData = [
+        'period' => '1M',
+        'quantity' => 1,
+        'update_orders' => false,           // injected - admin must win
+        'files' => [['filename' => 'evil']], // injected - admin must win
+    ];
+
+    $result = $service->attachOrderConfig($productModel, $clientData);
+
+    // Allowlisted client keys are preserved (the merge is admin-over-client,
+    // not admin-replaces-entire-client).
+    expect($result['period'])->toBe('1M');
+    expect($result['quantity'])->toBe(1);
+
+    // Admin-controlled keys take precedence over the client-supplied values.
+    expect($result['update_orders'])->toBeTrue('client override of admin-controlled update_orders leaked through merge');
+    expect($result['files'])->toBe([$fileDefinition], 'client override of admin-controlled files leaked through merge');
+});
+
+test('attachOrderConfig throws when product has no files configured', function (): void {
+    $service = new Service();
+    $productModel = serviceDownloadableCreateProductEntity(config: ['files' => []]);
+
+    expect(fn (): array => $service->attachOrderConfig($productModel, ['period' => '1M']))
+        ->toThrow(Exception::class, 'Product is not configured completely.');
+});
+
+test('product file upload rejects a request without the expected file field', function (): void {
+    $service = new Service();
+
+    $request = new Symfony\Component\HttpFoundation\Request();
+    $request->files = new Symfony\Component\HttpFoundation\FileBag([
+        'other' => new UploadedFile(__FILE__, 'other.txt', null, UPLOAD_ERR_OK, true),
+    ]);
+
+    $di = container();
+    $di['request'] = $request;
+    $service->setDi($di);
+
+    $productModel = serviceDownloadableCreateProductEntity();
+
+    expect(fn (): bool => $service->uploadProductFile($productModel))
+        ->toThrow(FOSSBilling\Core\Exception\BaseException::class, 'File upload failed: no files in request.');
+});
+
+test('sendFile streams the stored file as an attachment download', function (): void {
+    $storedName = str_repeat('a1b2c3d4', 8);
+    $storedPath = Symfony\Component\Filesystem\Path::join(PATH_UPLOADS, $storedName);
+    file_put_contents($storedPath, 'download-me');
+
+    try {
+        $file = createEntity(ServiceDownloadableFile::class, [
+            'id' => 5,
+            'filename' => 'product-file.zip',
+            'storedFilename' => $storedName,
+        ]);
+
+        $di = container();
+        $di['response_factory'] = fn (): ResponseFactory => new ResponseFactory();
+
+        $service = new Service();
+        $service->setDi($di);
+
+        $response = $service->sendFile($file);
+
+        expect($response->getStatusCode())->toBe(200)
+            ->and($response->headers->get('Content-Type'))->toBe('application/octet-stream')
+            ->and($response->headers->get('Content-Disposition'))->toBe('attachment; filename=product-file.zip');
+    } finally {
+        @unlink($storedPath);
+    }
+});
+
+test('sendProductFile streams the configured product file as an attachment download', function (): void {
+    $fileKey = str_repeat('b2c3d4e5', 4);
+    $storedName = str_repeat('a1b2c3d4', 8);
+    $storedPath = Symfony\Component\Filesystem\Path::join(PATH_UPLOADS, $storedName);
+    file_put_contents($storedPath, 'download-me');
+
+    try {
+        $product = serviceDownloadableCreateProductEntity(3, [
+            'files' => [
+                ['id' => $fileKey, 'filename' => 'product-file.zip', 'stored_filename' => $storedName],
+            ],
+        ]);
+
+        $di = container();
+        $di['response_factory'] = fn (): ResponseFactory => new ResponseFactory();
+
+        $service = new Service();
+        $service->setDi($di);
+
+        $response = $service->sendProductFile($product, $fileKey);
+
+        expect($response->getStatusCode())->toBe(200)
+            ->and($response->headers->get('Content-Type'))->toBe('application/octet-stream')
+            ->and($response->headers->get('Content-Disposition'))->toBe('attachment; filename=product-file.zip');
+    } finally {
+        @unlink($storedPath);
+    }
+});

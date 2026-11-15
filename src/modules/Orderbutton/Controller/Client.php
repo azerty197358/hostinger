@@ -1,0 +1,45 @@
+<?php
+
+declare(strict_types=1);
+/**
+ * Copyright 2022-2025 FOSSBilling
+ * SPDX-License-Identifier: Apache-2.0.
+ *
+ * @copyright FOSSBilling (https://www.fossbilling.org)
+ * @license http://www.apache.org/licenses/LICENSE-2.0 Apache-2.0
+ */
+
+namespace Box\Mod\Orderbutton\Controller;
+
+use Symfony\Component\HttpFoundation\Response;
+
+class Client implements \FOSSBilling\Core\Container\InjectionAwareInterface
+{
+    protected ?\Pimple\Container $di = null;
+
+    public function setDi(\Pimple\Container $di): void
+    {
+        $this->di = $di;
+    }
+
+    public function getDi(): ?\Pimple\Container
+    {
+        return $this->di;
+    }
+
+    public function register(\FOSSBilling\Core\Http\App &$app): void
+    {
+        $app->get('/orderbutton', 'get_index', [], static::class);
+        $app->get('/orderbutton/js', 'get_js', [], static::class);
+    }
+
+    public function get_index(\FOSSBilling\Core\Http\App $app): string
+    {
+        return $app->render('mod_orderbutton_index');
+    }
+
+    public function get_js(\FOSSBilling\Core\Http\App $app): Response
+    {
+        return $app->renderResponse('mod_orderbutton_embed_js', [], 200, ['Content-Type' => 'application/javascript']);
+    }
+}

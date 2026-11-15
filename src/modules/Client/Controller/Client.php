@@ -1,0 +1,124 @@
+<?php
+
+declare(strict_types=1);
+/**
+ * Copyright 2022-2025 FOSSBilling
+ * SPDX-License-Identifier: Apache-2.0.
+ *
+ * @copyright FOSSBilling (https://www.fossbilling.org)
+ * @license http://www.apache.org/licenses/LICENSE-2.0 Apache-2.0
+ */
+
+namespace Box\Mod\Client\Controller;
+
+use FOSSBilling\Core\Security\RandomizedTimeFloor;
+use Symfony\Component\HttpFoundation\Response;
+
+class Client implements \FOSSBilling\Core\Container\InjectionAwareInterface
+{
+    protected ?\Pimple\Container $di = null;
+
+    public function setDi(\Pimple\Container $di): void
+    {
+        $this->di = $di;
+    }
+
+    public function getDi(): ?\Pimple\Container
+    {
+        return $this->di;
+    }
+
+    public function register(\FOSSBilling\Core\Http\App &$app): void
+    {
+        $app->get('/client/reset-password-confirm/:hash', 'get_reset_password_confirm', ['hash' => '[a-z0-9]+'], static::class);
+        $app->get('/client', 'get_client_index', [], static::class);
+        $app->get('/client/logout', 'get_client_logout', [], static::class);
+        $app->get('/client/:page', 'get_client_page', ['page' => '[a-z0-9-]+'], static::class);
+        $app->get('/client/confirm-email/:hash', 'get_client_confirmation', ['hash' => '[a-z0-9]+'], static::class);
+    }
+
+    public function get_client_index(\FOSSBilling\Core\Http\App $app): string
+    {
+        $this->di['is_client_logged'];
+
+        return $app->render('mod_client_index');
+    }
+
+    public function get_client_confirmation(\FOSSBilling\Core\Http\App $app, $hash): string|Response
+    {
+        if ($error = $this->checkPageRateLimit($app, 'client_email_confirm_ip')) {
+            return $error;
+        }
+
+        $startedAt = microtime(true);
+        $service = $this->di['mod_service']('client');
+
+        try {
+            $service->approveClientEmailByHash($hash);
+        } finally {
+            RandomizedTimeFloor::apply($startedAt);
+        }
+
+        $systemService = $this->di['mod_service']('System');
+        $systemService->setPendingMessage(__trans('Email address was confirmed'));
+
+        return $app->redirect('/');
+    }
+
+    public function get_client_logout(\FOSSBilling\Core\Http\App $app): Response
+    {
+        $api = $this->di['api_client'];
+        $api->profile_logout();
+
+        return $app->redirect('/');
+    }
+
+    public function get_client_page(\FOSSBilling\Core\Http\App $app, $page): string
+    {
+        $this->di['is_client_logged'];
+        $template = 'mod_client_' . $page;
+
+        return $app->render($template);
+    }
+
+    public function get_reset_password_confirm(\FOSSBilling\Core\Http\App $app, $hash): string|Response
+    {
+        if ($error = $this->checkPageRateLimit($app, 'client_password_reset_confirm_ip')) {
+            return $error;
+        }
+
+        $service = $this->di['mod_service']('client');
+        $data = [
+            'hash' => $hash,
+        ];
+
+        $startedAt = microtime(true);
+
+        try {
+            $result = $service->password_reset_valid($data);
+        } finally {
+            RandomizedTimeFloor::apply($startedAt);
+        }
+
+        if ($result !== false) {
+            return $app->render('mod_client_set_new_password', ['hash' => $hash]);
+        }
+
+        return $app->redirect('/');
+    }
+
+    private function checkPageRateLimit(\FOSSBilling\Core\Http\App $app, string $policy): ?Response
+    {
+        $result = $this->di['rate_limiter']->consume($policy, (string) $this->di['request']->getClientIp());
+        if (!$result->isLimited()) {
+            return null;
+        }
+
+        $headers = [];
+        if ($result->hasRetryAfter()) {
+            $headers['Retry-After'] = (string) $result->getRetryAfterSeconds();
+        }
+
+        return $app->errorResponse(new \FOSSBilling\Core\Security\RateLimitException($result), 429, $headers);
+    }
+}

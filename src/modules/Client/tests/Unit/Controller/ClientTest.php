@@ -1,0 +1,59 @@
+<?php
+
+/**
+ * Copyright 2022-2026 FOSSBilling
+ * SPDX-License-Identifier: Apache-2.0.
+ *
+ * @copyright FOSSBilling (https://www.fossbilling.org)
+ * @license http://www.apache.org/licenses/LICENSE-2.0 Apache-2.0
+ */
+
+declare(strict_types=1);
+
+use Box\Mod\Client\Controller\Client;
+
+use function Tests\Helpers\container;
+use function Tests\Helpers\moduleService;
+
+test('password reset confirmation passes the validated hash to the template', function (): void {
+    $hash = 'password';
+
+    $service = Mockery::mock(Box\Mod\Client\Service::class);
+    $service->shouldReceive('password_reset_valid')
+        ->once()
+        ->with(['hash' => $hash])
+        ->andReturn(1);
+
+    $di = container();
+    $di['mod_service'] = $di->protect(moduleService(['client' => $service]));
+
+    $controller = new Client();
+    $controller->setDi($di);
+
+    $boxAppMock = Mockery::mock(FOSSBilling\Core\Http\App::class);
+    $boxAppMock->shouldReceive('render')
+        ->once()
+        ->with('mod_client_set_new_password', ['hash' => $hash])
+        ->andReturn('rendered');
+
+    expect($controller->get_reset_password_confirm($boxAppMock, $hash))->toBe('rendered');
+});
+
+test('route constraints are keyed by parameters that exist in the route', function (): void {
+    $routes = [];
+    $app = Mockery::mock(FOSSBilling\Core\Http\App::class);
+    $app->shouldReceive('get')->andReturnUsing(function (string $url, string $method, array $conditions, ?string $class = null) use (&$routes): void {
+        $routes[$url] = $conditions;
+    });
+
+    $controller = new Client();
+    $controller->register($app);
+
+    expect($routes)->not->toBeEmpty();
+    foreach ($routes as $url => $conditions) {
+        preg_match_all('@:([a-zA-Z_\-]+)@', $url, $matches);
+        // A constraint keyed by a name that is not in the path is silently ignored, leaving the real
+        // parameter unconstrained.
+        expect(array_diff(array_keys($conditions), $matches[1]))->toBe([], "unknown constraint key on {$url}");
+    }
+});

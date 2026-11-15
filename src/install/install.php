@@ -357,7 +357,7 @@ final class FOSSBilling_Installer
         $databaseName = (string) $this->session->get('database_name');
 
         $adminPdo = new PDO(
-            "pgsql:host={$host};port={$port};dbname=postgres",
+            "pgsql:host={$host};port={$port};dbname=postgres;sslmode=require",
             $user,
             $password,
             [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION],

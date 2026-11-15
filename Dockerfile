@@ -24,10 +24,10 @@ RUN set -eux; \
     libzip-dev \
     unzip \
     libpq-dev \
-    libonig-dev \
+    libsqlite3-dev \
     zlib1g-dev; \
   docker-php-ext-configure gd --with-freetype --with-jpeg; \
-  docker-php-ext-install -j"$(nproc)" bz2 gd intl mbstring pdo_mysql pdo_pgsql pdo_sqlite zip; \
+  docker-php-ext-install -j"$(nproc)" bz2 gd intl pdo_mysql pdo_pgsql pdo_sqlite zip; \
   a2enmod rewrite; \
   apt-mark auto '.*' > /dev/null; \
   apt-mark manual \

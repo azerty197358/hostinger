@@ -150,6 +150,20 @@ final class FOSSBilling_Installer
                     $this->session->set('currency_code', $this->request->request->get('currency_code'));
 
                     // Handle database information
+                    $databaseUrl = trim((string) $this->request->request->get('database_url', ''));
+                    if ($databaseUrl !== '') {
+                        $parsedUrl = @parse_url($databaseUrl);
+                        if (is_array($parsedUrl) && isset($parsedUrl['host']) && isset($parsedUrl['user'])) {
+                            $urlPath = $parsedUrl['path'] ?? '/postgres';
+                            $urlDriver = ($parsedUrl['scheme'] ?? '') === 'mysql' ? 'pdo_mysql' : 'pdo_pgsql';
+                            $this->request->request->set('database_driver', $urlDriver);
+                            $this->request->request->set('database_hostname', $parsedUrl['host']);
+                            $this->request->request->set('database_port', (string) ($parsedUrl['port'] ?? ($urlDriver === 'pdo_pgsql' ? 5432 : 3306)));
+                            $this->request->request->set('database_name', rawurldecode(ltrim($urlPath, '/')) ?: 'postgres');
+                            $this->request->request->set('database_username', rawurldecode((string) $parsedUrl['user']));
+                            $this->request->request->set('database_password', isset($parsedUrl['pass']) ? rawurldecode((string) $parsedUrl['pass']) : '');
+                        }
+                    }
                     $databaseDriver = (string) $this->request->request->get('database_driver', 'pdo_mysql');
                     if (!in_array($databaseDriver, FOSSBilling\Core\Doctrine\DriverManagerFactory::SUPPORTED_DRIVERS, true)) {
                         throw new Exception('Unsupported database driver.');

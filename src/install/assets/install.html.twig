@@ -124,6 +124,12 @@
                         <small id="database-upgrade-notice" hidden>PostgreSQL and SQLite are supported for new installs. Future updates keep the database structure current automatically, but one-time data migrations tied to a specific historical release are MySQL/MariaDB-only - MySQL/MariaDB is recommended if your installation may need one of those.</small>
                     </fieldset>
 
+                    <fieldset id="database-connection-url-fieldset">
+                        <label for="database_url">Supabase Connection String (optional)</label>
+                        <input type="text" id="database_url" name="database_url" autocomplete="off" spellcheck="false" placeholder="postgresql://postgres.xxxxx:password@aws-0-eu-central-1.pooler.supabase.com:5432/postgres">
+                        <small>Paste the <strong>Session Pooler</strong> connection string here. The fields below will be filled automatically.</small>
+                    </fieldset>
+
                     <fieldset id="database-server-fields">
                         <label for="database_hostname">Database Hostname <span class="red">*</span></label>
                         <input type="text" id="database_hostname" name="database_hostname" value="{{ request.database_hostname|default(database_hostname)|default('localhost') }}" placeholder="localhost, mysql, db.domain.com, 12.34.56.78 ..." required>
@@ -329,6 +335,47 @@
             const databaseUpgradeNotice = document.getElementById('database-upgrade-notice');
             const databasePortInput = document.getElementById('database_port');
             const defaultPortByDriver = { pdo_mysql: '3306', pdo_pgsql: '5432' };
+            const databaseUrlInput = document.getElementById('database_url');
+            const databaseHostnameInput = document.getElementById('database_hostname');
+            const databasePortInputEl = document.getElementById('database_port');
+            const databaseNameInput = document.getElementById('database_name');
+            const databaseUsernameInput = document.getElementById('database_username');
+            const databasePasswordInput = document.getElementById('database_password');
+
+            function applyConnectionString() {
+                const value = (databaseUrlInput.value || '').trim();
+                if (!value) {
+                    return;
+                }
+
+                const match = value.match(/^(?:postgres(?:ql)?:\/\/)?([^:\/]+)(?::([^@]*))?@([^:\/]+)(?::(\d+))?\/([^?\s]+)/);
+                if (!match) {
+                    return;
+                }
+
+                try {
+                    databaseDriverSelect.value = 'pdo_pgsql';
+                    databaseUsernameInput.value = decodeURIComponent(match[1]);
+                    if (match[2] !== undefined) {
+                        try {
+                            databasePasswordInput.value = decodeURIComponent(match[2]);
+                        } catch (e) {
+                            databasePasswordInput.value = match[2];
+                        }
+                    }
+                    databaseHostnameInput.value = match[3];
+                    databasePortInputEl.value = match[4] || '5432';
+                    databaseNameInput.value = match[5].split('?')[0] || 'postgres';
+                    updateDatabaseFields();
+                } catch (e) {
+                    // Ignore malformed connection strings; the normal fields remain editable.
+                }
+            }
+
+            if (databaseUrlInput) {
+                databaseUrlInput.addEventListener('input', applyConnectionString);
+                databaseUrlInput.addEventListener('paste', function () { setTimeout(applyConnectionString, 0); });
+            }
 
             function setFieldsetActive(fieldset, active) {
                 fieldset.hidden = !active;

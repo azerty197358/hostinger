@@ -118,7 +118,7 @@
                         <label for="database_driver">Database Type <span class="red">*</span></label>
                         <select id="database_driver" name="database_driver">
                             <option value="pdo_mysql" {% if selectedDriver == 'pdo_mysql' %} selected {% endif %}>MySQL / MariaDB</option>
-                            <option value="pdo_pgsql" {% if selectedDriver == 'pdo_pgsql' %} selected {% endif %}>PostgreSQL</option>
+                            <option value="pdo_pgsql" {% if selectedDriver == 'pdo_pgsql' %} selected {% endif %}>Supabase (PostgreSQL)</option>
                             <option value="pdo_sqlite" {% if selectedDriver == 'pdo_sqlite' %} selected {% endif %}>SQLite</option>
                         </select>
                         <small id="database-upgrade-notice" hidden>PostgreSQL and SQLite are supported for new installs. Future updates keep the database structure current automatically, but one-time data migrations tied to a specific historical release are MySQL/MariaDB-only - MySQL/MariaDB is recommended if your installation may need one of those.</small>

@@ -11,5 +11,9 @@ chown -R www-data:www-data "$DATA_DIR" || true
 sed -i "s/Listen 80/Listen ${PORT}/" /etc/apache2/ports.conf
 sed -i "s/\\*:80/\\*:${PORT}/g" /etc/apache2/sites-available/000-default.conf
 
+# PHP requires the prefork MPM; disable any others to avoid "More than one MPM loaded".
+a2dismod mpm_event mpm_worker mpm_prefork || true
+a2enmod mpm_prefork
+
 cron
 exec apache2-foreground

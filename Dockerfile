@@ -161,7 +161,10 @@ RUN set -eux; \
   crontab -u www-data /tmp/www-data.cron; \
   rm /tmp/www-data.cron
 
-CMD ["sh", "-c", "cron & exec apache2-foreground"]
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
+CMD ["docker-entrypoint.sh"]
 
 FROM runtime AS test
 

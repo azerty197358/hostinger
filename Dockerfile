@@ -65,10 +65,8 @@ COPY src/core ./src/core
 COPY src/library ./src/library
 COPY src/modules ./src/modules
 
-RUN --mount=type=cache,target=/tmp/composer-cache,id=composer-prod \
-  set -eux; \
+RUN set -eux; \
   find ./src/modules -type d -name tests -prune -exec rm -rf {} +; \
-  COMPOSER_CACHE_DIR=/tmp/composer-cache \
   composer install --prefer-dist --no-dev --optimize-autoloader --no-interaction --no-progress
 
 FROM composer-base AS php-dev-vendor
@@ -77,9 +75,7 @@ COPY src/core ./src/core
 COPY src/library ./src/library
 COPY src/modules ./src/modules
 
-RUN --mount=type=cache,target=/tmp/composer-cache,id=composer-dev \
-  COMPOSER_CACHE_DIR=/tmp/composer-cache \
-  composer install --prefer-dist --optimize-autoloader --no-interaction --no-progress
+RUN composer install --prefer-dist --optimize-autoloader --no-interaction --no-progress
 
 FROM node:${NODE_VERSION}-bookworm-slim AS frontend-assets
 
@@ -89,7 +85,7 @@ COPY package.json package-lock.json ./
 COPY src/themes/default/admin/package.json src/themes/default/admin/package.json
 COPY src/themes/default/client/package.json src/themes/default/client/package.json
 
-RUN --mount=type=cache,target=/root/.npm npm ci
+RUN npm ci
 
 COPY tsconfig.json ./
 COPY src/themes/default/admin ./src/themes/default/admin

@@ -47,7 +47,7 @@ define('PATH_THEMES', Path::join(PATH_ROOT, 'themes'));
 define('PATH_LICENSE', Path::join(PATH_ROOT, 'LICENSE'));
 define('PATH_SQL_DATA', Path::join(PATH_ROOT, 'install', 'sql', 'content.sql'));
 define('PATH_INSTALL', Path::join(PATH_ROOT, 'install'));
-define('PATH_CONFIG', Path::join(PATH_ROOT, 'config.php'));
+define('PATH_CONFIG', getenv('FOSSBILLING_CONFIG') ?: Path::join(PATH_ROOT, 'config.php'));
 define('PATH_CONFIG_SAMPLE', Path::join(PATH_ROOT, 'config-sample.php'));
 define('PATH_CRON', Path::join(PATH_ROOT, 'cron.php'));
 define('PATH_LANGS', Path::join(PATH_ROOT, 'locale'));

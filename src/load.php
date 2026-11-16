@@ -295,7 +295,7 @@ function preInit(): void
         (new Filesystem())->mkdir($pathUploads, 0o755);
     }
     define('PATH_UPLOADS', $pathUploads);
-    define('PATH_CONFIG', Path::join(PATH_ROOT, 'config.php'));
+    define('PATH_CONFIG', getenv('FOSSBILLING_CONFIG') ?: Path::join(PATH_ROOT, 'config.php'));
 
     // Load required FOSSBilling libraries.
     require Path::join(PATH_CORE, 'Http', 'ErrorPage.php');

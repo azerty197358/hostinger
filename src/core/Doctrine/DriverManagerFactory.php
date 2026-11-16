@@ -66,6 +66,38 @@ class DriverManagerFactory
      */
     public static function getDatabaseConfig(): array
     {
+        $databaseUrl = (string) (getenv('DATABASE_URL') ?: getenv('DB_URL') ?: '');
+        if ($databaseUrl !== '') {
+            $parsed = @parse_url($databaseUrl);
+            if (is_array($parsed) && isset($parsed['host']) && isset($parsed['user'])) {
+                $driver = str_contains((string) ($parsed['scheme'] ?? ''), 'mysql') ? 'pdo_mysql' : 'pdo_pgsql';
+                $path = trim((string) ($parsed['path'] ?? ''), '/');
+
+                return [
+                    'driver' => $driver,
+                    'host' => $parsed['host'],
+                    'port' => (int) ($parsed['port'] ?? ($driver === 'pdo_pgsql' ? 5432 : 3306)),
+                    'name' => rawurldecode($path) ?: ($driver === 'pdo_pgsql' ? 'postgres' : 'mysql'),
+                    'user' => rawurldecode((string) $parsed['user']),
+                    'password' => isset($parsed['pass']) ? rawurldecode((string) $parsed['pass']) : '',
+                ];
+            }
+        }
+
+        if (getenv('DB_DRIVER')) {
+            $driver = (string) getenv('DB_DRIVER');
+            $defaultPort = $driver === 'pdo_pgsql' ? 5432 : 3306;
+
+            return [
+                'driver' => $driver,
+                'host' => (string) (getenv('DB_HOST') ?: 'localhost'),
+                'port' => (int) (getenv('DB_PORT') ?: $defaultPort),
+                'name' => (string) (getenv('DB_NAME') ?: ($driver === 'pdo_pgsql' ? 'postgres' : 'mysql')),
+                'user' => (string) (getenv('DB_USER') ?: ''),
+                'password' => (string) (getenv('DB_PASSWORD') ?: getenv('DB_PASS') ?: ''),
+            ];
+        }
+
         $dbConfig = Config::getProperty('db', []);
         if (!is_array($dbConfig)) {
             throw new Exception('Database configuration is invalid.');

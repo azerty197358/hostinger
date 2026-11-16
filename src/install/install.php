@@ -150,7 +150,7 @@ final class FOSSBilling_Installer
                     $this->session->set('currency_code', $this->request->request->get('currency_code'));
 
                     // Handle database information
-                    $databaseUrl = trim((string) $this->request->request->get('database_url', ''));
+                    $databaseUrl = trim((string) ($this->request->request->get('database_url') ?: getenv('DATABASE_URL') ?: getenv('DB_URL') ?: ''));
                     if ($databaseUrl !== '') {
                         $parsedUrl = @parse_url($databaseUrl);
                         if (is_array($parsedUrl) && isset($parsedUrl['host']) && isset($parsedUrl['user'])) {
